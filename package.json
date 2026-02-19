@@ -1,0 +1,31 @@
+{
+  "name": "grinfi-mcp-server",
+  "version": "1.0.0",
+  "description": "MCP Server for Grinfi.io — connect Claude to your Grinfi account",
+  "main": "dist/index.js",
+  "bin": {
+    "grinfi-mcp-server": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsc --watch"
+  },
+  "keywords": [
+    "mcp",
+    "grinfi",
+    "claude",
+    "ai",
+    "leadgen",
+    "linkedin",
+    "outreach"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "@types/node": "^22.0.0"
+  }
+}
