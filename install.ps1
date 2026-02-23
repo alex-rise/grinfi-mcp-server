@@ -92,6 +92,23 @@ if (Test-Path $configFile) {
     Write-Host "OK Config created" -ForegroundColor Green
 }
 
+# Install Claude Code skill
+Write-Host ""
+Write-Host "Step 4: Installing Claude Code skill..." -ForegroundColor White
+
+$skillSource = Join-Path $scriptDir "SKILL.md"
+$skillDir = Join-Path $env:USERPROFILE ".claude\skills\grinfi-mcp"
+
+if (Test-Path $skillSource) {
+    if (!(Test-Path $skillDir)) {
+        New-Item -ItemType Directory -Path $skillDir -Force | Out-Null
+    }
+    Copy-Item $skillSource (Join-Path $skillDir "SKILL.md") -Force
+    Write-Host "OK Skill installed to $skillDir\SKILL.md" -ForegroundColor Green
+} else {
+    Write-Host "SKILL.md not found in repo — skipping skill install" -ForegroundColor Yellow
+}
+
 # Done
 Write-Host ""
 Write-Host "========================================" -ForegroundColor Green
@@ -104,4 +121,5 @@ Write-Host "  2. Look for 'grinfi' in the MCP tools list" -ForegroundColor Cyan
 Write-Host "  3. Try: 'Show me all my Grinfi contacts'" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "  Config: $configFile" -ForegroundColor Yellow
+Write-Host "  Skill:  $skillDir\SKILL.md" -ForegroundColor Yellow
 Write-Host ""
