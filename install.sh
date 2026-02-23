@@ -89,17 +89,21 @@ JSONEOF
 
     if [ -f "$CONFIG_FILE" ]; then
         if command -v python3 &> /dev/null; then
-            python3 -c "
+            python3 << PYBLOCK
 import json
 config_path = '$CONFIG_FILE'
+new_server_json = '''$NEW_SERVER'''
 with open(config_path, 'r') as f:
     config = json.load(f)
 config.setdefault('mcpServers', {})
-config['mcpServers']['grinfi'] = json.loads('''$NEW_SERVER''')
+config['mcpServers']['grinfi'] = json.loads(new_server_json)
 with open(config_path, 'w') as f:
     json.dump(config, f, indent=2)
 print('merged')
-" 2>/dev/null && echo -e "${GREEN}✓${NC} Merged into existing config" || {
+PYBLOCK
+            if [ $? -eq 0 ]; then
+                echo -e "${GREEN}✓${NC} Merged into existing config"
+            else
                 echo -e "${YELLOW}Could not merge automatically. Writing new config.${NC}"
                 cat > "$CONFIG_FILE" <<JSONEOF2
 {
@@ -109,7 +113,7 @@ print('merged')
 }
 JSONEOF2
                 echo -e "${GREEN}✓${NC} Config written"
-            }
+            fi
         else
             cat > "$CONFIG_FILE" <<JSONEOF3
 {
@@ -132,6 +136,21 @@ JSONEOF4
     fi
 fi
 
+# Install Claude Code skill
+echo ""
+echo -e "${BOLD}Step 4: Installing Claude Code skill...${NC}"
+
+SKILL_SOURCE="$SCRIPT_DIR/SKILL.md"
+SKILL_DIR="$HOME/.claude/skills/grinfi-mcp"
+
+if [ -f "$SKILL_SOURCE" ]; then
+    mkdir -p "$SKILL_DIR"
+    cp "$SKILL_SOURCE" "$SKILL_DIR/SKILL.md"
+    echo -e "${GREEN}✓${NC} Skill installed to ${CYAN}$SKILL_DIR/SKILL.md${NC}"
+else
+    echo -e "${YELLOW}⚠ SKILL.md not found in repo — skipping skill install${NC}"
+fi
+
 # Done
 echo ""
 echo -e "${GREEN}${BOLD}========================================${NC}"
@@ -144,4 +163,5 @@ echo -e "  2. Look for ${CYAN}grinfi${NC} in the MCP tools list (hammer icon)"
 echo -e "  3. Try: ${CYAN}\"Show me all my Grinfi contacts\"${NC}"
 echo ""
 echo -e "  Config: ${YELLOW}$CONFIG_FILE${NC}"
+echo -e "  Skill:  ${YELLOW}$SKILL_DIR/SKILL.md${NC}"
 echo ""
