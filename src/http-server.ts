@@ -14,6 +14,8 @@
  */
 
 import { createServer, IncomingMessage, ServerResponse } from "node:http";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
@@ -126,11 +128,25 @@ function enrichResult(data: unknown): unknown {
 
 // --- Build MCP server with all tools ---
 
+function loadSkillInstructions(): string {
+  try {
+    // Try loading SKILL.md from project root (one level up from dist/)
+    const skillPath = join(__dirname, "..", "SKILL.md");
+    const raw = readFileSync(skillPath, "utf-8");
+    // Strip YAML frontmatter (between --- markers)
+    const stripped = raw.replace(/^---[\s\S]*?---\s*/, "");
+    return stripped.trim();
+  } catch {
+    return "";
+  }
+}
+
 function createMcpServer(): McpServer {
-  const server = new McpServer({
-    name: "grinfi",
-    version: "1.0.0",
-  });
+  const instructions = loadSkillInstructions();
+  const server = new McpServer(
+    { name: "grinfi", version: "1.0.0" },
+    instructions ? { instructions } : undefined
+  );
 
   // CONTACTS
   server.tool(
@@ -576,10 +592,8 @@ function createMcpServer(): McpServer {
 
 const PORT = parseInt(process.env.PORT ?? "3000", 10);
 
-const mcpServer = createMcpServer();
-
-// Map to track transports by session ID
-const transports = new Map<string, StreamableHTTPServerTransport>();
+// Track sessions: each session gets its own McpServer + Transport pair
+const sessions = new Map<string, { transport: StreamableHTTPServerTransport; server: McpServer }>();
 
 const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse) => {
   // Health check
@@ -605,17 +619,55 @@ const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse
     return;
   }
 
+  // Check for existing session
+  const sessionId = req.headers["mcp-session-id"] as string | undefined;
+
+  if (sessionId && sessions.has(sessionId)) {
+    // Existing session - route to the existing transport
+    const session = sessions.get(sessionId)!;
+    try {
+      await session.transport.handleRequest(req, res);
+    } catch (error) {
+      console.error("MCP session request error:", error);
+      if (!res.headersSent) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Internal server error" }));
+      }
+    }
+    return;
+  }
+
+  // Handle DELETE for session cleanup
+  if (req.method === "DELETE") {
+    if (sessionId && sessions.has(sessionId)) {
+      const session = sessions.get(sessionId)!;
+      await session.server.close();
+      sessions.delete(sessionId);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ success: true }));
+    } else {
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Session not found" }));
+    }
+    return;
+  }
+
+  // New session - create a fresh McpServer + Transport pair
   try {
+    const mcpServer = createMcpServer();
+
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => crypto.randomUUID(),
-      onsessioninitialized: (sessionId) => {
-        transports.set(sessionId, transport);
+      onsessioninitialized: (newSessionId) => {
+        sessions.set(newSessionId, { transport, server: mcpServer });
       },
     });
 
     transport.onclose = () => {
-      const sessionId = transport.sessionId;
-      if (sessionId) transports.delete(sessionId);
+      const sid = transport.sessionId;
+      if (sid) {
+        sessions.delete(sid);
+      }
     };
 
     await mcpServer.connect(transport);
@@ -631,5 +683,5 @@ const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse
 
 httpServer.listen(PORT, "0.0.0.0", () => {
   console.log(`Grinfi MCP HTTP server running on http://0.0.0.0:${PORT}/mcp`);
-  console.log("Health check: http://0.0.0.0:${PORT}/health");
+  console.log(`Health check: http://0.0.0.0:${PORT}/health`);
 });
