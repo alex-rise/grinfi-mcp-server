@@ -121,13 +121,21 @@ stop_automation(flow_uuid)
 
 ## Step 6: Pipeline Stage Updates
 
-Use `change_contact_pipeline_stage`, not `update_contact` (which does not support pipeline_stage_uuid).
+**MANDATORY RULE:** Before ANY pipeline stage change, you MUST first call `list_pipeline_stages(object="lead")` to get the exact UUIDs. Never guess or hardcode stage UUIDs — they are different for every account. Cache the result for the duration of the conversation and reuse it.
 
-```
-change_contact_pipeline_stage(contact_uuids=[UUID], pipeline_stage_uuid=STAGE_UUID)
-```
+**How to change pipeline stage (step by step):**
 
-List available stages: `list_pipeline_stages(object="lead")`
+1. Call `list_pipeline_stages(object="lead")` — get all available stages with their UUIDs and names
+2. Find the target stage UUID from the response by matching the stage name
+3. Call `change_contact_pipeline_stage(contact_uuids=[UUID], pipeline_stage_uuid=STAGE_UUID)`
+
+**Important rules:**
+- NEVER use `update_contact` for pipeline changes — it does not support pipeline_stage_uuid
+- NEVER use `leads_mass_action` as a fallback — use `change_contact_pipeline_stage` which calls the same API correctly
+- `contact_uuids` must be an array of strings, even for a single contact: `["uuid-here"]`
+- `pipeline_stage_uuid` must be a valid UUID from `list_pipeline_stages` response
+- If the API returns "No leads found to apply action", the contact UUID is wrong — re-fetch the contact first
+- Process contacts ONE BY ONE if batch fails — do not retry the entire batch
 
 ---
 
@@ -210,3 +218,7 @@ Solution: Use `change_contact_pipeline_stage` with the correct UUID.
 **Contact not found by find_contact**
 Cause: LinkedIn URL format varies.
 Solution: Try both the full URL and just the LinkedIn ID/handle. Also try search_contacts with name + company filter.
+
+**change_contact_pipeline_stage fails or returns error**
+Cause: Usually wrong pipeline_stage_uuid (guessed instead of fetched) or wrong contact UUID.
+Solution: 1) Call `list_pipeline_stages(object="lead")` to get real stage UUIDs. 2) Verify the contact UUID exists via `get_contact`. 3) Pass `contact_uuids` as an array: `["uuid"]`. 4) Do NOT fall back to `leads_mass_action` — it uses the same API and will fail the same way.
