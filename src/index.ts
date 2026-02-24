@@ -976,44 +976,44 @@ function createMcpServer(): McpServer {
     }
   );
 
-  server.tool("complete_task", "Mark a task as completed.", { uuid: z.string().describe("UUID of the task to complete") }, async (params) => {
+  server.tool("complete_task", "Mark a MANUAL task as completed. Do NOT use for automatic (automation-created) tasks.", { uuid: z.string().describe("UUID of the manual task to complete") }, async (params) => {
     const result = await grinfiRequest("PUT", `/flows/api/tasks/${params.uuid}/complete`);
     return jsonResult(result);
   });
 
-  server.tool("cancel_task", "Cancel a task.", { uuid: z.string().describe("UUID of the task to cancel") }, async (params) => {
+  server.tool("cancel_task", "Cancel a MANUAL task. Do NOT use for automatic (automation-created) tasks.", { uuid: z.string().describe("UUID of the manual task to cancel") }, async (params) => {
     const result = await grinfiRequest("PUT", `/flows/api/tasks/${params.uuid}/cancel`);
     return jsonResult(result);
   });
 
-  server.tool("fail_task", "Mark a task as failed.", { uuid: z.string().describe("UUID of the task to fail") }, async (params) => {
+  server.tool("fail_task", "Mark a MANUAL task as failed. Do NOT use for automatic (automation-created) tasks.", { uuid: z.string().describe("UUID of the manual task to fail") }, async (params) => {
     const result = await grinfiRequest("PUT", `/flows/api/tasks/${params.uuid}/fail`);
     return jsonResult(result);
   });
 
-  server.tool("mass_cancel_tasks", "Cancel multiple tasks at once.", {
-    uuids: z.array(z.string()).describe("Array of task UUIDs to cancel"),
+  server.tool("mass_cancel_tasks", "Cancel multiple MANUAL tasks at once. Do NOT use for automatic (automation-created) tasks.", {
+    uuids: z.array(z.string()).describe("Array of manual task UUIDs to cancel"),
   }, async (params) => {
     const result = await grinfiRequest("PUT", "/flows/api/tasks/mass-cancel", { uuids: params.uuids });
     return jsonResult(result);
   });
 
-  server.tool("mass_complete_tasks", "Mark multiple tasks as completed at once.", {
-    uuids: z.array(z.string()).describe("Array of task UUIDs to complete"),
+  server.tool("mass_complete_tasks", "Mark multiple MANUAL tasks as completed at once. Do NOT use for automatic (automation-created) tasks.", {
+    uuids: z.array(z.string()).describe("Array of manual task UUIDs to complete"),
   }, async (params) => {
     const result = await grinfiRequest("PUT", "/flows/api/tasks/mass-complete", { uuids: params.uuids });
     return jsonResult(result);
   });
 
-  server.tool("mass_retry_tasks", "Retry multiple failed tasks at once.", {
-    uuids: z.array(z.string()).describe("Array of task UUIDs to retry"),
+  server.tool("mass_retry_tasks", "Retry multiple failed MANUAL tasks at once. Do NOT use for automatic (automation-created) tasks.", {
+    uuids: z.array(z.string()).describe("Array of manual task UUIDs to retry"),
   }, async (params) => {
     const result = await grinfiRequest("PUT", "/flows/api/tasks/mass-retry", { uuids: params.uuids });
     return jsonResult(result);
   });
 
-  server.tool("mass_skip_tasks", "Skip multiple tasks at once.", {
-    uuids: z.array(z.string()).describe("Array of task UUIDs to skip"),
+  server.tool("mass_skip_tasks", "Skip multiple MANUAL tasks at once. Do NOT use for automatic (automation-created) tasks.", {
+    uuids: z.array(z.string()).describe("Array of manual task UUIDs to skip"),
   }, async (params) => {
     const result = await grinfiRequest("PUT", "/flows/api/tasks/mass-skip", { uuids: params.uuids });
     return jsonResult(result);
