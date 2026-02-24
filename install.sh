@@ -10,30 +10,86 @@ BOLD='\033[1m'
 
 echo ""
 echo -e "${CYAN}${BOLD}========================================${NC}"
-echo -e "${CYAN}${BOLD}   Grinfi MCP Server — Quick Install    ${NC}"
+echo -e "${CYAN}${BOLD}   Grinfi MCP Server - Quick Install    ${NC}"
+echo -e "${CYAN}${BOLD}        for macOS / Linux                ${NC}"
 echo -e "${CYAN}${BOLD}========================================${NC}"
 echo ""
 
-# Check Node.js
-if ! command -v node &> /dev/null; then
-    echo -e "${RED}Node.js is not installed.${NC}"
-    echo -e "Please install Node.js 18+ from ${CYAN}https://nodejs.org${NC}"
-    exit 1
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
+
+# ----- Node.js -----
+install_node_mac() {
+    # Try Homebrew first
+    if command -v brew &> /dev/null; then
+        echo -e "${YELLOW}Installing Node.js via Homebrew...${NC}"
+        brew install node
+        return $?
+    fi
+
+    # Install Homebrew, then Node.js
+    echo -e "${YELLOW}Homebrew not found. Installing Homebrew first...${NC}"
+    echo -e "  (This is the official macOS package manager - ${CYAN}https://brew.sh${NC})"
+    echo ""
+    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+    # Homebrew may need to be added to PATH after install
+    if [[ -f /opt/homebrew/bin/brew ]]; then
+        eval "$(/opt/homebrew/bin/brew shellenv)"
+    elif [[ -f /usr/local/bin/brew ]]; then
+        eval "$(/usr/local/bin/brew shellenv)"
+    fi
+
+    echo -e "${YELLOW}Installing Node.js via Homebrew...${NC}"
+    brew install node
+}
+
+install_node_linux() {
+    echo -e "${YELLOW}Installing Node.js...${NC}"
+    if command -v apt-get &> /dev/null; then
+        curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+        sudo apt-get install -y nodejs
+    elif command -v dnf &> /dev/null; then
+        curl -fsSL https://rpm.nodesource.com/setup_22.x | sudo bash -
+        sudo dnf install -y nodejs
+    elif command -v pacman &> /dev/null; then
+        sudo pacman -S --noconfirm nodejs npm
+    else
+        echo -e "${RED}Could not detect package manager.${NC}"
+        echo -e "Please install Node.js 18+ manually from ${CYAN}https://nodejs.org${NC}"
+        exit 1
+    fi
+}
+
+if command -v node &> /dev/null; then
+    NODE_VERSION=$(node -v | sed 's/v//' | cut -d. -f1)
+    if [ "$NODE_VERSION" -ge 18 ]; then
+        echo -e "${GREEN}OK${NC} Node.js $(node -v) detected"
+    else
+        echo -e "${YELLOW}Node.js $(node -v) is too old (need 18+). Updating...${NC}"
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+            install_node_mac
+        else
+            install_node_linux
+        fi
+        echo -e "${GREEN}OK${NC} Node.js $(node -v) installed"
+    fi
+else
+    echo -e "${YELLOW}Node.js not found. Installing automatically...${NC}"
+    echo ""
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        install_node_mac
+    else
+        install_node_linux
+    fi
+    echo ""
+    echo -e "${GREEN}OK${NC} Node.js $(node -v) installed"
 fi
 
-NODE_VERSION=$(node -v | sed 's/v//' | cut -d. -f1)
-if [ "$NODE_VERSION" -lt 18 ]; then
-    echo -e "${RED}Node.js 18+ is required. You have $(node -v).${NC}"
-    echo -e "Please update from ${CYAN}https://nodejs.org${NC}"
-    exit 1
-fi
-
-echo -e "${GREEN}✓${NC} Node.js $(node -v) detected"
-
-# Get API key
+# ----- API Key -----
 echo ""
-echo -e "${BOLD}Step 1: Enter your Grinfi API key${NC}"
-echo -e "  Get it from: ${CYAN}Grinfi.io → Settings → API Keys${NC}"
+echo -e "${BOLD}Enter your Grinfi API key${NC}"
+echo -e "  Get it from: ${CYAN}https://leadgen.grinfi.io/settings/api-keys${NC}"
 echo ""
 read -rp "  API Key: " GRINFI_API_KEY
 
@@ -42,31 +98,27 @@ if [ -z "$GRINFI_API_KEY" ]; then
     exit 1
 fi
 
-echo -e "${GREEN}✓${NC} API key saved"
+echo -e "${GREEN}OK${NC} API key saved"
 
-# Install & build
+# ----- Install & Build -----
 echo ""
-echo -e "${BOLD}Step 2: Installing dependencies...${NC}"
-
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-cd "$SCRIPT_DIR"
-
+echo -e "${BOLD}Installing dependencies...${NC}"
 npm install --silent 2>&1 | tail -1
-echo -e "${GREEN}✓${NC} Dependencies installed"
+echo -e "${GREEN}OK${NC} Dependencies installed"
 
+echo -e "${BOLD}Building server...${NC}"
 npm run build --silent 2>&1
-echo -e "${GREEN}✓${NC} Server built"
+echo -e "${GREEN}OK${NC} Server built"
 
-# Detect config path
+# ----- Configure Claude Desktop -----
 echo ""
-echo -e "${BOLD}Step 3: Configuring Claude Desktop...${NC}"
+echo -e "${BOLD}Configuring Claude Desktop...${NC}"
 
 if [[ "$OSTYPE" == "darwin"* ]]; then
     CLAUDE_CONFIG_DIR="$HOME/Library/Application Support/Claude"
 elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
     CLAUDE_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/Claude"
 else
-    echo -e "${YELLOW}Could not detect OS. Please configure manually (see README).${NC}"
     CLAUDE_CONFIG_DIR=""
 fi
 
@@ -102,9 +154,9 @@ with open(config_path, 'w') as f:
 print('merged')
 PYBLOCK
             if [ $? -eq 0 ]; then
-                echo -e "${GREEN}✓${NC} Merged into existing config"
+                echo -e "${GREEN}OK${NC} Merged into existing config"
             else
-                echo -e "${YELLOW}Could not merge automatically. Writing new config.${NC}"
+                echo -e "${YELLOW}Could not merge. Writing new config.${NC}"
                 cat > "$CONFIG_FILE" <<JSONEOF2
 {
   "mcpServers": {
@@ -112,7 +164,7 @@ PYBLOCK
   }
 }
 JSONEOF2
-                echo -e "${GREEN}✓${NC} Config written"
+                echo -e "${GREEN}OK${NC} Config written"
             fi
         else
             cat > "$CONFIG_FILE" <<JSONEOF3
@@ -122,7 +174,7 @@ JSONEOF2
   }
 }
 JSONEOF3
-            echo -e "${GREEN}✓${NC} Config written"
+            echo -e "${GREEN}OK${NC} Config written"
         fi
     else
         cat > "$CONFIG_FILE" <<JSONEOF4
@@ -132,13 +184,13 @@ JSONEOF3
   }
 }
 JSONEOF4
-        echo -e "${GREEN}✓${NC} Config created"
+        echo -e "${GREEN}OK${NC} Config created"
     fi
 fi
 
-# Install Claude Code skill
+# ----- Install Claude Code skill -----
 echo ""
-echo -e "${BOLD}Step 4: Installing Claude Code skill...${NC}"
+echo -e "${BOLD}Installing Claude Code skill...${NC}"
 
 SKILL_SOURCE="$SCRIPT_DIR/SKILL.md"
 SKILL_DIR="$HOME/.claude/skills/grinfi-mcp"
@@ -146,22 +198,22 @@ SKILL_DIR="$HOME/.claude/skills/grinfi-mcp"
 if [ -f "$SKILL_SOURCE" ]; then
     mkdir -p "$SKILL_DIR"
     cp "$SKILL_SOURCE" "$SKILL_DIR/SKILL.md"
-    echo -e "${GREEN}✓${NC} Skill installed to ${CYAN}$SKILL_DIR/SKILL.md${NC}"
+    echo -e "${GREEN}OK${NC} Skill installed to ${CYAN}$SKILL_DIR/SKILL.md${NC}"
 else
-    echo -e "${YELLOW}⚠ SKILL.md not found in repo — skipping skill install${NC}"
+    echo -e "${YELLOW}SKILL.md not found - skipping skill install${NC}"
 fi
 
-# Done
+# ----- Done -----
 echo ""
 echo -e "${GREEN}${BOLD}========================================${NC}"
 echo -e "${GREEN}${BOLD}   Installation Complete!                ${NC}"
 echo -e "${GREEN}${BOLD}========================================${NC}"
 echo ""
-echo -e "  ${BOLD}Next steps:${NC}"
-echo -e "  1. Restart Claude Desktop (quit and reopen)"
-echo -e "  2. Look for ${CYAN}grinfi${NC} in the MCP tools list (hammer icon)"
-echo -e "  3. Try: ${CYAN}\"Show me all my Grinfi contacts\"${NC}"
+echo -e "  ${BOLD}What to do now:${NC}"
+echo -e "  1. ${BOLD}Quit${NC} Claude Desktop completely (right-click dock icon > Quit)"
+echo -e "  2. ${BOLD}Reopen${NC} Claude Desktop"
+echo -e "  3. Look for ${CYAN}grinfi${NC} in the tools list (hammer icon)"
+echo -e "  4. Try: ${CYAN}\"Show me all my Grinfi contacts\"${NC}"
 echo ""
 echo -e "  Config: ${YELLOW}$CONFIG_FILE${NC}"
-echo -e "  Skill:  ${YELLOW}$SKILL_DIR/SKILL.md${NC}"
 echo ""

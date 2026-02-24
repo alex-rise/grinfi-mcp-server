@@ -1,80 +1,55 @@
 # Grinfi MCP Server
 
-Connect **Claude AI** to your **[Grinfi.io](https://grinfi.io)** account and manage your outreach through natural language - no clicking through interfaces, no copy-pasting between tools.
-
-With this integration you can ask Claude things like:
-
-- *"Check my unread LinkedIn messages and summarize who replied"*
-- *"Add these 3 contacts to the Outreach EU automation"*
-- *"Find John from Acme Corp and send him a follow-up"*
-- *"Show me all HOT leads from this week"*
-- *"Create a follow-up task for Maria in 1 week"*
+Connect **Claude** to your **Grinfi.io** account. Manage contacts, automations, messages, and more — all through natural language.
 
 ---
 
-## What you need before starting
+## Quick Start
 
-- **Node.js 18 or newer** - [download here](https://nodejs.org) (if unsure, run `node -v` in your terminal)
-- **Claude Desktop** or **Claude Code**
-- **A Grinfi.io account** with an API key
+### 1. Get your API key
 
----
+Go to **[Grinfi → Settings → API Keys](https://leadgen.grinfi.io/settings/api-keys)** and copy your key.
 
-## Installation
+### 2. Download this repository
 
-### Step 1 - Get your Grinfi API key
+Click the green **"Code"** button above → **"Download ZIP"**, then unzip it.
 
-Log in to [Grinfi.io](https://grinfi.io) → go to **Settings** → **API Keys** → copy your key.
-
-### Step 2 - Clone the repo
-
+Or clone with Git:
 ```bash
 git clone https://github.com/alex-rise/grinfi-mcp-server.git
-cd grinfi-mcp-server
 ```
 
-### Step 3 - Run the installer
-
-**macOS / Linux:**
-Double-click `install.sh`, or run in terminal:
-```bash
-bash install.sh
-```
-
-**Windows:**
-Double-click `install.ps1`, or run in PowerShell:
-```powershell
-powershell -ExecutionPolicy Bypass -File install.ps1
-```
-
-> **Note for macOS:** If double-click doesn't work, right-click the file → Open With → Terminal.
-
-The installer will ask for your API key, install everything, configure Claude Desktop, and install the skill file automatically.
-
-### Step 4 - Restart Claude Desktop
-
-Quit and reopen Claude Desktop. You should see **grinfi** in the tools list (hammer icon in the bottom left).
-
-That's it - you're ready.
+### 3. Run the installer for your OS
 
 ---
 
-## Manual setup (optional)
+## macOS Installation
 
-If you prefer to configure things yourself instead of using the installer:
+### Option A: Use the installer (recommended)
+
+1. Open **Terminal** (press `Cmd + Space`, type **Terminal**, press Enter)
+2. Type `bash ` (with a space after it)
+3. **Drag the `install.sh` file** from Finder into the Terminal window — the path fills in automatically
+4. Press **Enter**
+5. When prompted, paste your **Grinfi API key** and press Enter
+
+The installer will automatically:
+- Install **Homebrew** (if not installed)
+- Install **Node.js** (if not installed)
+- Install all dependencies and build the server
+- Configure Claude Desktop
+
+> **Note:** If macOS asks for your password, enter your Mac login password and press Enter. This is normal — it's installing system packages.
+
+### Option B: Manual setup (macOS)
 
 ```bash
+cd grinfi-mcp-server
 npm install
 npm run build
 ```
 
-Then add the following to your Claude Desktop config file:
-
-| OS | Config file location |
-|---|---|
-| macOS | `~/Library/Application Support/Claude/claude_desktop_config.json` |
-| Windows | `%APPDATA%\Claude\claude_desktop_config.json` |
-| Linux | `~/.config/Claude/claude_desktop_config.json` |
+Then add this to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
 ```json
 {
@@ -90,105 +65,203 @@ Then add the following to your Claude Desktop config file:
 }
 ```
 
-**For Claude Code:**
-```bash
-claude mcp add grinfi -- env GRINFI_API_KEY=your-api-key-here node /full/path/to/grinfi-mcp-server/dist/index.js
+---
+
+## Windows Installation
+
+### Option A: Use the installer (recommended)
+
+1. Open the **grinfi-mcp-server** folder in File Explorer
+2. Right-click on **`install.ps1`**
+3. Select **"Run with PowerShell"**
+4. If Windows shows a security warning, type **R** and press Enter
+5. When prompted, paste your **Grinfi API key** and press Enter
+
+The installer will automatically:
+- Install **Node.js** via winget (if not installed)
+- Install all dependencies and build the server
+- Configure Claude Desktop
+
+> **If right-click doesn't show "Run with PowerShell":** Open PowerShell manually (press `Win + X`, choose "PowerShell"), then run:
+> ```powershell
+> cd "$HOME\Documents\grinfi-mcp-server"
+> powershell -ExecutionPolicy Bypass -File install.ps1
+> ```
+
+### Option B: Manual setup (Windows)
+
+```powershell
+cd grinfi-mcp-server
+npm install
+npm run build
+```
+
+Then add this to `%APPDATA%\Claude\claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "grinfi": {
+      "command": "node",
+      "args": ["C:/full/path/to/grinfi-mcp-server/dist/index.js"],
+      "env": {
+        "GRINFI_API_KEY": "your-api-key-here"
+      }
+    }
+  }
+}
 ```
 
 ---
 
-## Skill file (for Claude Code)
+## After Installation (All Platforms)
 
-The installer automatically places a **skill file** at:
+1. **Restart Claude Desktop** — quit completely (not just close the window) and reopen
+2. Look for **"grinfi"** in the tools list (hammer icon at the bottom of the chat)
+3. Start chatting! Try: *"Show me all my contacts"*
 
-| OS | Skill file location |
-|---|---|
-| macOS / Linux | `~/.claude/skills/grinfi-mcp/SKILL.md` |
-| Windows | `%USERPROFILE%\.claude\skills\grinfi-mcp\SKILL.md` |
+---
 
-The skill file teaches Claude how to use Grinfi tools efficiently — how to process inbox, classify leads, schedule follow-ups, and manage automations. It's loaded automatically by Claude Code.
-
-### What the skill includes
-
-- Step-by-step workflows for inbox processing
-- Lead classification rules (HOT / WARM / NEUTRAL / REJECTION)
-- Task scheduling guidelines with timezone handling
-- Pipeline management best practices
-- Mass processing workflow for 30+ unread messages
-- Known API quirks and workarounds
-
-### Editing the skill
-
-If you want to customize how Claude works with your Grinfi account, edit the skill file directly:
+## Claude Code Configuration
 
 ```bash
-# macOS / Linux
-nano ~/.claude/skills/grinfi-mcp/SKILL.md
-
-# Or open in any editor
-code ~/.claude/skills/grinfi-mcp/SKILL.md
+claude mcp add grinfi -- node /full/path/to/grinfi-mcp-server/dist/index.js
 ```
 
-The source file is also in the repo root: `SKILL.md`. If you want to reset to defaults, re-run the installer or copy it manually:
+Then set the environment variable before running Claude Code:
 
 ```bash
-cp SKILL.md ~/.claude/skills/grinfi-mcp/SKILL.md
+export GRINFI_API_KEY="your-api-key-here"
+claude
 ```
 
+---
 
-## What Claude can do with Grinfi
+## Cloud Endpoint (Paid Claude plans)
 
-### Contacts and lists
-- Find contacts by LinkedIn URL, email, or name
-- Search and filter your CRM with any criteria
-- Create, update, and organize contacts into lists
+If you have a paid Claude plan, you can use our hosted cloud endpoint — no local installation needed.
+
+Visit **[mcp.grinfi.io](https://mcp.grinfi.io)** to generate your personal MCP endpoint URL.
+
+---
+
+## Available Tools
+
+### Contacts
+
+| Tool | Description |
+|------|-------------|
+| `find_contact` | Find a contact by LinkedIn ID, email, or name + company |
+| `search_contacts` | Search contacts with filters, sorting, pagination |
+| `get_contact` | Get contact details by UUID |
+| `update_contact` | Update contact fields |
+| `delete_contact` | Delete a contact |
+| `upsert_contact` | Create or update a contact in a list |
+
+### Lists
+
+| Tool | Description |
+|------|-------------|
+| `list_lists` | Get all contact lists |
+| `get_list` | Get a list by UUID |
+| `create_list` | Create a new list |
 
 ### Automations
-- Start, stop, and monitor your outreach sequences
-- Add or remove contacts from automations
-- Resume paused automations for contacts who replied
 
-### Inbox (LinkedIn + Email)
-- Check unread conversations across all sender profiles
-- Read and summarize message threads
-- Send LinkedIn messages and emails directly
-- Mark conversations as read
+| Tool | Description |
+|------|-------------|
+| `list_automations` | Get all automations |
+| `start_automation` | Start an automation |
+| `stop_automation` | Stop an automation |
+| `add_contact_to_automation` | Add existing contact to automation |
+| `add_new_contact_to_automation` | Create contact and add to automation |
+| `cancel_contact_from_automations` | Cancel contact from specific automations |
+| `cancel_contact_from_all_automations` | Cancel contact from all automations |
 
-### Tasks and follow-ups
-- Schedule follow-up tasks for specific dates
-- View and manage your task queue
-- Bulk complete or cancel tasks
+### Unibox (Messages)
 
-### Pipeline management
-- Move contacts between pipeline stages
-- Track where each lead is in your sales process
+| Tool | Description |
+|------|-------------|
+| `list_linkedin_messages` | List LinkedIn messages |
+| `get_unread_conversations` | Get contacts with unread messages |
+| `mark_conversation_as_read` | Mark a LinkedIn conversation as read |
+| `send_linkedin_message` | Send a LinkedIn message |
+| `list_emails` | List emails |
+| `send_email` | Send an email |
 
-### Sender profiles and mailboxes
-- View all your connected LinkedIn and email accounts
-- Check mailbox status and sending limits
+### Sender Profiles
+
+| Tool | Description |
+|------|-------------|
+| `list_sender_profiles` | List all sender profiles |
+| `get_sender_profile` | Get sender profile details |
+| `create_sender_profile` | Create a new sender profile |
+
+---
+
+## Example Conversations
+
+**Find a contact:**
+> "Find the contact with email john@example.com"
+
+**Search with filters:**
+> "Show me contacts at Google created after January 2024"
+
+**Manage automations:**
+> "List my automations and start the one called CMO Germany"
+
+**Send messages:**
+> "Send a LinkedIn message to Anna saying we have a new case study"
 
 ---
 
 ## Troubleshooting
 
-**"GRINFI_API_KEY is not set"**
-Your API key isn't being passed to the server. Double-check it's in the config file under `env.GRINFI_API_KEY` - no extra spaces or quotes.
+### "GRINFI_API_KEY is not set"
 
-**Tools not showing up in Claude**
-Restart Claude Desktop completely (quit, not just close the window). Make sure the path to `dist/index.js` in your config is the full absolute path.
+Make sure your API key is configured. Re-run the installer or edit the Claude Desktop config file manually (see Manual Setup sections above).
 
-**401 or 403 API errors**
-Your API key is invalid or expired. Go to Grinfi.io → Settings → API Keys and generate a new one.
+### Tools not showing in Claude
 
-**Build errors or something broke after an update**
+1. Make sure Claude Desktop is **fully restarted** (quit and reopen, not just close window)
+2. Check the config file path is correct for your OS
+3. Make sure the path to `dist/index.js` is absolute (starts with `/` on Mac or `C:\` on Windows)
+
+### API errors (401/403)
+
+Your API key may be invalid or expired. Generate a new one in [Grinfi → Settings → API Keys](https://leadgen.grinfi.io/settings/api-keys).
+
+### Build errors
+
 ```bash
+cd grinfi-mcp-server
 rm -rf node_modules dist
 npm install
 npm run build
 ```
 
-**Skill not working in Claude Code**
-Check that the file exists at `~/.claude/skills/grinfi-mcp/SKILL.md`. If not, copy it manually from the repo root: `cp SKILL.md ~/.claude/skills/grinfi-mcp/SKILL.md`
+### Installer won't start (Mac)
+
+Make sure you typed `bash ` (with a space) before dragging the file. The full command should look like:
+```
+bash /Users/yourname/Documents/grinfi-mcp-server/install.sh
+```
+
+### PowerShell error (Windows)
+
+Try running PowerShell as Administrator: right-click PowerShell in Start menu → "Run as administrator", then:
+```powershell
+cd "$HOME\Documents\grinfi-mcp-server"
+powershell -ExecutionPolicy Bypass -File install.ps1
+```
+
+---
+
+## Requirements
+
+- **Node.js 18+** — installed automatically by the installer, or [download manually](https://nodejs.org)
+- **Claude Desktop** — [download here](https://claude.com/download)
+- **Grinfi.io account** with an API key
 
 ---
 
