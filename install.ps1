@@ -153,7 +153,8 @@ if (Test-Path $configFile) {
         $grinfiObj = $grinfiBlock | ConvertFrom-Json
         $config.mcpServers | Add-Member -NotePropertyName "grinfi" -NotePropertyValue $grinfiObj -Force
 
-        $config | ConvertTo-Json -Depth 10 | Set-Content $configFile -Encoding UTF8
+        $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+        [System.IO.File]::WriteAllText($configFile, ($config | ConvertTo-Json -Depth 10), $utf8NoBom)
         Write-Host "OK Merged into existing config" -ForegroundColor Green
     } catch {
         Write-Host "Could not merge config, writing fresh..." -ForegroundColor Yellow
@@ -164,7 +165,8 @@ if (Test-Path $configFile) {
   }
 }
 "@
-        $freshConfig | Set-Content $configFile -Encoding UTF8
+        $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+        [System.IO.File]::WriteAllText($configFile, $freshConfig, $utf8NoBom)
         Write-Host "OK Config written" -ForegroundColor Green
     }
 } else {
@@ -175,7 +177,8 @@ if (Test-Path $configFile) {
   }
 }
 "@
-    $freshConfig | Set-Content $configFile -Encoding UTF8
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($configFile, $freshConfig, $utf8NoBom)
     Write-Host "OK Config created" -ForegroundColor Green
 }
 
