@@ -72,21 +72,14 @@ Then add this to `~/Library/Application Support/Claude/claude_desktop_config.jso
 ### Option A: Use the installer (recommended)
 
 1. Open the **grinfi-mcp-server** folder in File Explorer
-2. Right-click on **`install.ps1`**
-3. Select **"Run with PowerShell"**
-4. If Windows shows a security warning, type **R** and press Enter
-5. When prompted, paste your **Grinfi API key** and press Enter
+2. **Double-click `install.bat`**
+3. If Windows shows a security warning ("Windows protected your PC"), click **"More info"** then **"Run anyway"**
+4. When prompted, paste your **Grinfi API key** and press Enter
 
 The installer will automatically:
 - Install **Node.js** via winget (if not installed)
 - Install all dependencies and build the server
 - Configure Claude Desktop
-
-> **If right-click doesn't show "Run with PowerShell":** Open PowerShell manually (press `Win + X`, choose "PowerShell"), then run:
-> ```powershell
-> cd "$HOME\Documents\grinfi-mcp-server"
-> powershell -ExecutionPolicy Bypass -File install.ps1
-> ```
 
 ### Option B: Manual setup (Windows)
 
@@ -247,9 +240,11 @@ Make sure you typed `bash ` (with a space) before dragging the file. The full co
 bash /Users/yourname/Documents/grinfi-mcp-server/install.sh
 ```
 
-### PowerShell error (Windows)
+### Installer won't start (Windows)
 
-Try running PowerShell as Administrator: right-click PowerShell in Start menu → "Run as administrator", then:
+Make sure you're double-clicking **`install.bat`** (not `install.ps1`). If Windows blocks it, click "More info" → "Run anyway".
+
+If that doesn't work, open PowerShell manually (press `Win + X`, choose "PowerShell"), then run:
 ```powershell
 cd "$HOME\Documents\grinfi-mcp-server"
 powershell -ExecutionPolicy Bypass -File install.ps1
