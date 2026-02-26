@@ -77,6 +77,38 @@ async function grinfiRequest(
   }
 }
 
+
+async function grinfiUpload(
+  path: string,
+  fileBuffer: Buffer,
+  fileName: string,
+  mimeType: string,
+): Promise<unknown> {
+  const url = new URL(path, BASE_URL);
+  const formData = new FormData();
+  const blob = new Blob([new Uint8Array(fileBuffer)], { type: mimeType });
+  formData.append("attachment", blob, fileName);
+  formData.append("payload[size]", String(fileBuffer.length));
+  formData.append("payload[type]", mimeType);
+  formData.append("payload[name]", fileName);
+
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${getApiKey()}`,
+    Accept: "application/json",
+  };
+
+  const response = await fetch(url.toString(), { method: "POST", headers, body: formData });
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`Grinfi API error ${response.status}: ${text}`);
+  }
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { rawResponse: text };
+  }
+}
+
 function enrichLeadWithLinks(lead: Record<string, unknown>): Record<string, unknown> {
   if (lead.uuid) {
     lead._grinfi_contact_url = `https://leadgen.grinfi.io/crm/contacts/${lead.uuid}`;
@@ -183,9 +215,16 @@ function createMcpServer(): McpServer {
 
   server.tool(
     "search_contacts",
-    "Search contacts with filters, sorting, and pagination. Filter supports: scalar values (equals), arrays (IN), objects with operators (>=, <=, >, <, =, !=, <>), 'is_null', 'is_not_null'. Results include _grinfi_contact_url (https://leadgen.grinfi.io/crm/contacts/{uuid}) and _linkedin_url for each contact.",
+    `Search contacts with filters, sorting, and pagination. Filter supports: scalar values (equals), arrays (IN), objects with operators (>=, <=, >, <, =, !=, <>), 'is_null', 'is_not_null'.
+
+IMPORTANT: To search by name, company, or any text — use filter.q (e.g. filter: {q: "John Doe"}).
+Text fields like first_name, last_name, name, company_name do NOT work as direct filters.
+
+Supported filter fields: q (text search by name/company/email), list_uuid, pipeline_stage_uuid, email_status, linkedin_status, status, tags (array of tag UUIDs), sender_profile_uuid, data_source_uuid, created_at, updated_at (with operators >= <= etc).
+
+Results include _grinfi_contact_url and _linkedin_url for each contact.`,
     {
-      filter: z.record(z.string(), z.unknown()).optional().describe("Filter object"),
+      filter: z.record(z.string(), z.unknown()).optional().describe("Filter object. Use 'q' key for text search by name/company (e.g. {q: 'John'}). Other keys: list_uuid, pipeline_stage_uuid, email_status, linkedin_status, status, tags, sender_profile_uuid, created_at, updated_at"),
       limit: z.number().optional().describe("Number of results to return (default 20)"),
       offset: z.number().optional().describe("Number of results to skip (default 0)"),
       order_field: z.string().optional().describe("Field to sort by (default: created_at)"),
@@ -768,6 +807,16 @@ function createMcpServer(): McpServer {
     return jsonResult(result);
   });
 
+  server.tool("upload_attachment", "Upload a file attachment. Provide the file as a base64-encoded string. Returns the attachment UUID and name to use with send_linkedin_message or send_email. Max 20MB. Allowed types: png, gif, jpg, jpeg, pdf, doc(x), xls(x), ppt(x), mp4, mov.", {
+    file_base64: z.string().describe("Base64-encoded file content"),
+    file_name: z.string().describe("File name with extension (e.g. 'proposal.pdf')"),
+    mime_type: z.string().describe("MIME type (e.g. 'application/pdf', 'image/png')"),
+  }, async (params) => {
+    const fileBuffer = Buffer.from(params.file_base64, "base64");
+    const result = await grinfiUpload("/flows/api/attachments", fileBuffer, params.file_name, params.mime_type);
+    return jsonResult(result);
+  });
+
   // ===========================
   // ENRICHMENT
   // ===========================
@@ -1140,14 +1189,24 @@ function createMcpServer(): McpServer {
     return jsonResult(result);
   });
 
-  server.tool("send_linkedin_message", "Send a LinkedIn message to a contact.", {
+  server.tool("send_linkedin_message", "Send a LinkedIn message to a contact. Set linkedin_messenger_type to 'sn' for InMail (requires subject). Use 'basic' (default) for regular LinkedIn message. To attach files, first upload them with upload_attachment, then pass their UUIDs and names in the attachments array.", {
     sender_profile_uuid: z.string(), lead_uuid: z.string(), text: z.string(),
     template_uuid: z.string().optional(),
+    linkedin_messenger_type: z.enum(["basic", "sn"]).optional().default("basic").describe("'basic' for regular LinkedIn message, 'sn' for InMail"),
+    subject: z.string().optional().describe("Subject line (required for InMail, ignored for basic messages)"),
+    attachments: z.array(z.object({ uuid: z.string(), name: z.string() })).optional().describe("Array of attachment objects {uuid, name} from upload_attachment"),
   }, async (params) => {
     const body: Record<string, unknown> = {
       sender_profile_uuid: params.sender_profile_uuid, lead_uuid: params.lead_uuid, text: params.text,
+      linkedin_messenger_type: params.linkedin_messenger_type || "basic",
     };
     if (params.template_uuid) body.template_uuid = params.template_uuid;
+    if (params.subject) body.subject = params.subject;
+    if (params.attachments && params.attachments.length > 0) {
+      body.attachments = params.attachments;
+    } else {
+      body.attachments = [];
+    }
     const result = await grinfiRequest("POST", "/flows/api/linkedin-messages", body);
     return jsonResult(result);
   });

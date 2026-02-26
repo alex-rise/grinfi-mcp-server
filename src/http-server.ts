@@ -19,29 +19,29 @@ import { join } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
+import { tenantStorage, getTenantApiKey } from "./tenant-context.js";
+import { loadTenants, registerTenant, getApiKeyByToken, getTenantCount } from "./tenant-store.js";
+import { getLandingPageHtml } from "./landing-page.js";
 
 // --- Helpers ---
 
 const BASE_URL = "https://leadgen.grinfi.io";
 
 function getApiKey(): string {
+  // Multi-tenant: check AsyncLocalStorage first
+  const tenantKey = getTenantApiKey();
+  if (tenantKey) return tenantKey;
+
+  // Fallback: owner's env var
   const key = process.env.GRINFI_API_KEY;
   if (!key) {
     throw new Error(
-      "GRINFI_API_KEY environment variable is not set. " +
-        "Get your API key from Grinfi.io → Settings → API Keys."
+      "No API key available. Neither tenant context nor GRINFI_API_KEY env var is set."
     );
   }
   return key;
 }
 
-function getMcpApiKey(): string {
-  const key = process.env.MCP_API_KEY;
-  if (!key) {
-    throw new Error("MCP_API_KEY environment variable is not set. Set a secret key to protect this endpoint.");
-  }
-  return key;
-}
 
 async function grinfiRequest(
   method: string,
@@ -82,6 +82,38 @@ async function grinfiRequest(
     throw new Error(`Grinfi API error ${response.status}: ${text}`);
   }
 
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { rawResponse: text };
+  }
+}
+
+
+async function grinfiUpload(
+  path: string,
+  fileBuffer: Buffer,
+  fileName: string,
+  mimeType: string,
+): Promise<unknown> {
+  const url = new URL(path, BASE_URL);
+  const formData = new FormData();
+  const blob = new Blob([new Uint8Array(fileBuffer)], { type: mimeType });
+  formData.append("attachment", blob, fileName);
+  formData.append("payload[size]", String(fileBuffer.length));
+  formData.append("payload[type]", mimeType);
+  formData.append("payload[name]", fileName);
+
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${getApiKey()}`,
+    Accept: "application/json",
+  };
+
+  const response = await fetch(url.toString(), { method: "POST", headers, body: formData });
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`Grinfi API error ${response.status}: ${text}`);
+  }
   try {
     return JSON.parse(text);
   } catch {
@@ -195,9 +227,16 @@ function createMcpServer(): McpServer {
 
   server.tool(
     "search_contacts",
-    "Search contacts with filters, sorting, and pagination. Filter supports: scalar values (equals), arrays (IN), objects with operators (>=, <=, >, <, =, !=, <>), 'is_null', 'is_not_null'. Results include _grinfi_contact_url (https://leadgen.grinfi.io/crm/contacts/{uuid}) and _linkedin_url for each contact.",
+    `Search contacts with filters, sorting, and pagination. Filter supports: scalar values (equals), arrays (IN), objects with operators (>=, <=, >, <, =, !=, <>), 'is_null', 'is_not_null'.
+
+IMPORTANT: To search by name, company, or any text — use filter.q (e.g. filter: {q: "John Doe"}).
+Text fields like first_name, last_name, name, company_name do NOT work as direct filters.
+
+Supported filter fields: q (text search by name/company/email), list_uuid, pipeline_stage_uuid, email_status, linkedin_status, status, tags (array of tag UUIDs), sender_profile_uuid, data_source_uuid, created_at, updated_at (with operators >= <= etc).
+
+Results include _grinfi_contact_url and _linkedin_url for each contact.`,
     {
-      filter: z.record(z.string(), z.unknown()).optional().describe("Filter object"),
+      filter: z.record(z.string(), z.unknown()).optional().describe("Filter object. Use 'q' key for text search by name/company (e.g. {q: 'John'}). Other keys: list_uuid, pipeline_stage_uuid, email_status, linkedin_status, status, tags, sender_profile_uuid, created_at, updated_at"),
       limit: z.number().optional().describe("Number of results to return (default 20)"),
       offset: z.number().optional().describe("Number of results to skip (default 0)"),
       order_field: z.string().optional().describe("Field to sort by (default: created_at)"),
@@ -780,6 +819,16 @@ function createMcpServer(): McpServer {
     return jsonResult(result);
   });
 
+  server.tool("upload_attachment", "Upload a file attachment. Provide the file as a base64-encoded string. Returns the attachment UUID and name to use with send_linkedin_message or send_email. Max 20MB. Allowed types: png, gif, jpg, jpeg, pdf, doc(x), xls(x), ppt(x), mp4, mov.", {
+    file_base64: z.string().describe("Base64-encoded file content"),
+    file_name: z.string().describe("File name with extension (e.g. 'proposal.pdf')"),
+    mime_type: z.string().describe("MIME type (e.g. 'application/pdf', 'image/png')"),
+  }, async (params) => {
+    const fileBuffer = Buffer.from(params.file_base64, "base64");
+    const result = await grinfiUpload("/flows/api/attachments", fileBuffer, params.file_name, params.mime_type);
+    return jsonResult(result);
+  });
+
   // ===========================
   // ENRICHMENT
   // ===========================
@@ -1152,14 +1201,24 @@ function createMcpServer(): McpServer {
     return jsonResult(result);
   });
 
-  server.tool("send_linkedin_message", "Send a LinkedIn message to a contact.", {
+  server.tool("send_linkedin_message", "Send a LinkedIn message to a contact. Set linkedin_messenger_type to 'sn' for InMail (requires subject). Use 'basic' (default) for regular LinkedIn message. To attach files, first upload them with upload_attachment, then pass their UUIDs and names in the attachments array.", {
     sender_profile_uuid: z.string(), lead_uuid: z.string(), text: z.string(),
     template_uuid: z.string().optional(),
+    linkedin_messenger_type: z.enum(["basic", "sn"]).optional().default("basic").describe("'basic' for regular LinkedIn message, 'sn' for InMail"),
+    subject: z.string().optional().describe("Subject line (required for InMail, ignored for basic messages)"),
+    attachments: z.array(z.object({ uuid: z.string(), name: z.string() })).optional().describe("Array of attachment objects {uuid, name} from upload_attachment"),
   }, async (params) => {
     const body: Record<string, unknown> = {
       sender_profile_uuid: params.sender_profile_uuid, lead_uuid: params.lead_uuid, text: params.text,
+      linkedin_messenger_type: params.linkedin_messenger_type || "basic",
     };
     if (params.template_uuid) body.template_uuid = params.template_uuid;
+    if (params.subject) body.subject = params.subject;
+    if (params.attachments && params.attachments.length > 0) {
+      body.attachments = params.attachments;
+    } else {
+      body.attachments = [];
+    }
     const result = await grinfiRequest("POST", "/flows/api/linkedin-messages", body);
     return jsonResult(result);
   });
@@ -1615,23 +1674,51 @@ function createMcpServer(): McpServer {
 const PORT = parseInt(process.env.PORT ?? "3000", 10);
 
 // Track sessions: each session gets its own McpServer + Transport pair
-const sessions = new Map<string, { transport: StreamableHTTPServerTransport; server: McpServer }>();
+// Track sessions: each session gets its own McpServer + Transport pair + optional tenant key
+const sessions = new Map<string, {
+  transport: StreamableHTTPServerTransport;
+  server: McpServer;
+  grinfiApiKey?: string;
+}>();
 
-function extractAuth(req: IncomingMessage): { authorized: boolean; mcpPath: boolean } {
+interface AuthResult {
+  authorized: boolean;
+  mcpPath: boolean;
+  grinfiApiKey?: string; // set for multi-tenant tokens
+}
+
+function extractAuth(req: IncomingMessage): AuthResult {
   const url = req.url ?? "";
-  const expectedKey = getMcpApiKey();
+  const ownerKey = process.env.MCP_API_KEY; // may be undefined
 
   // Pattern 1: /mcp/{key} (Claude.ai style - key in URL)
-  const urlMatch = url.match(/^\/mcp\/([a-zA-Z0-9]+)/);
+  const urlMatch = url.match(/^\/mcp\/([a-zA-Z0-9-]+)/);
   if (urlMatch) {
-    return { authorized: urlMatch[1] === expectedKey, mcpPath: true };
+    const token = urlMatch[1];
+    // Check owner key first
+    if (ownerKey && token === ownerKey) {
+      return { authorized: true, mcpPath: true };
+    }
+    // Check tenant store
+    const tenantApiKey = getApiKeyByToken(token);
+    if (tenantApiKey) {
+      return { authorized: true, mcpPath: true, grinfiApiKey: tenantApiKey };
+    }
+    return { authorized: false, mcpPath: true };
   }
 
   // Pattern 2: /mcp with Authorization: Bearer {key} (standard MCP)
   if (url === "/mcp") {
     const authHeader = req.headers.authorization;
-    if (authHeader && authHeader === `Bearer ${expectedKey}`) {
-      return { authorized: true, mcpPath: true };
+    if (authHeader) {
+      const bearerToken = authHeader.replace(/^Bearer\s+/i, "");
+      if (ownerKey && bearerToken === ownerKey) {
+        return { authorized: true, mcpPath: true };
+      }
+      const tenantApiKey = getApiKeyByToken(bearerToken);
+      if (tenantApiKey) {
+        return { authorized: true, mcpPath: true, grinfiApiKey: tenantApiKey };
+      }
     }
     return { authorized: false, mcpPath: true };
   }
@@ -1639,15 +1726,126 @@ function extractAuth(req: IncomingMessage): { authorized: boolean; mcpPath: bool
   return { authorized: false, mcpPath: false };
 }
 
+// --- Rate limiting for /api/register ---
+const rateLimitMap = new Map<string, { count: number; resetAt: number }>();
+const RATE_LIMIT = 10; // max registrations per IP per hour
+
+function checkRateLimit(ip: string): boolean {
+  const now = Date.now();
+  const entry = rateLimitMap.get(ip);
+  if (!entry || now > entry.resetAt) {
+    rateLimitMap.set(ip, { count: 1, resetAt: now + 3600_000 });
+    return true;
+  }
+  if (entry.count >= RATE_LIMIT) return false;
+  entry.count++;
+  return true;
+}
+
+/** Read full request body as string */
+function readBody(req: IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (c: Buffer) => chunks.push(c));
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
+    req.on("error", reject);
+  });
+}
+
+/** Validate a Grinfi API key by making a test request */
+async function validateGrinfiKey(apiKey: string): Promise<boolean> {
+  try {
+    const res = await fetch(new URL("/leads/api/lists?limit=1", BASE_URL).toString(), {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        Accept: "application/json",
+      },
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/** Run handler inside tenant AsyncLocalStorage context if needed */
+async function withTenantContext(grinfiApiKey: string | undefined, fn: () => Promise<void>): Promise<void> {
+  if (grinfiApiKey) {
+    await tenantStorage.run({ grinfiApiKey }, fn);
+  } else {
+    await fn();
+  }
+}
+
+// --- Load tenants at startup ---
+loadTenants();
+
+// --- HTTP Server ---
 const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse) => {
-  // Health check
-  if (req.url === "/health" && req.method === "GET") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ status: "ok", server: "grinfi-mcp" }));
+  const url = req.url ?? "";
+
+  // --- Landing page ---
+  if (url === "/" && req.method === "GET") {
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    res.end(getLandingPageHtml());
     return;
   }
 
-  // Check if this is an MCP request
+  // --- Health check ---
+  if (url === "/health" && req.method === "GET") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ status: "ok", server: "grinfi-mcp", tenants: getTenantCount() }));
+    return;
+  }
+
+  // --- Registration API ---
+  if (url === "/api/register" && req.method === "POST") {
+    const clientIp = (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim()
+      || req.socket.remoteAddress || "unknown";
+
+    if (!checkRateLimit(clientIp)) {
+      res.writeHead(429, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ success: false, error: "Too many requests. Please try again later." }));
+      return;
+    }
+
+    try {
+      const body = await readBody(req);
+      const { apiKey } = JSON.parse(body) as { apiKey?: string };
+
+      if (!apiKey || typeof apiKey !== "string" || apiKey.trim().length < 10) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: false, error: "Please provide a valid API key." }));
+        return;
+      }
+
+      const trimmedKey = apiKey.trim();
+
+      // Validate key against Grinfi API
+      const valid = await validateGrinfiKey(trimmedKey);
+      if (!valid) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          success: false,
+          error: "Invalid API key. Please check your key at Grinfi \u2192 Settings \u2192 API Keys."
+        }));
+        return;
+      }
+
+      const token = registerTenant(trimmedKey);
+      const endpointUrl = `https://mcp.grinfi.io/mcp/${token}`;
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ success: true, token, url: endpointUrl }));
+    } catch (error) {
+      console.error("Registration error:", error);
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ success: false, error: "Internal server error. Please try again." }));
+    }
+    return;
+  }
+
+  // --- MCP requests ---
   const auth = extractAuth(req);
 
   if (!auth.mcpPath) {
@@ -1666,10 +1864,10 @@ const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse
   const sessionId = req.headers["mcp-session-id"] as string | undefined;
 
   if (sessionId && sessions.has(sessionId)) {
-    // Existing session - route to the existing transport
     const session = sessions.get(sessionId)!;
+    const tenantKey = auth.grinfiApiKey ?? session.grinfiApiKey;
     try {
-      await session.transport.handleRequest(req, res);
+      await withTenantContext(tenantKey, () => session.transport.handleRequest(req, res));
     } catch (error) {
       console.error("MCP session request error:", error);
       if (!res.headersSent) {
@@ -1697,24 +1895,28 @@ const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse
 
   // New session - create a fresh McpServer + Transport pair
   try {
-    const mcpServer = createMcpServer();
+    const tenantKey = auth.grinfiApiKey;
 
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: () => crypto.randomUUID(),
-      onsessioninitialized: (newSessionId) => {
-        sessions.set(newSessionId, { transport, server: mcpServer });
-      },
+    await withTenantContext(tenantKey, async () => {
+      const mcpServer = createMcpServer();
+
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => crypto.randomUUID(),
+        onsessioninitialized: (newSessionId) => {
+          sessions.set(newSessionId, { transport, server: mcpServer, grinfiApiKey: tenantKey });
+        },
+      });
+
+      transport.onclose = () => {
+        const sid = transport.sessionId;
+        if (sid) {
+          sessions.delete(sid);
+        }
+      };
+
+      await mcpServer.connect(transport);
+      await transport.handleRequest(req, res);
     });
-
-    transport.onclose = () => {
-      const sid = transport.sessionId;
-      if (sid) {
-        sessions.delete(sid);
-      }
-    };
-
-    await mcpServer.connect(transport);
-    await transport.handleRequest(req, res);
   } catch (error) {
     console.error("MCP request error:", error);
     if (!res.headersSent) {
@@ -1725,6 +1927,8 @@ const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse
 });
 
 httpServer.listen(PORT, "0.0.0.0", () => {
-  console.log(`Grinfi MCP HTTP server running on http://0.0.0.0:${PORT}/mcp`);
+  console.log(`Grinfi MCP HTTP server running on http://0.0.0.0:${PORT}`);
+  console.log(`Landing page: http://0.0.0.0:${PORT}/`);
   console.log(`Health check: http://0.0.0.0:${PORT}/health`);
+  console.log(`MCP endpoint: http://0.0.0.0:${PORT}/mcp/{token}`);
 });
