@@ -205,7 +205,7 @@ function createMcpServer(): McpServer {
 
   server.tool(
     "find_contact",
-    "Find a single contact by LinkedIn ID, email, or name + company. You must provide at least one: linkedin_id, email, or both name and company_name. Results include _grinfi_contact_url (https://leadgen.grinfi.io/crm/contacts/{uuid}) and _linkedin_url. The Grinfi messenger is at https://leadgen.grinfi.io/messenger/",
+    "Find a single contact by LinkedIn ID or email. Requires linkedin_id or email — do NOT use this for searching by name. To search by name or company, use search_contacts with filter: {q: \"name\"}. Results include _grinfi_contact_url and _linkedin_url.",
     {
       linkedin_id: z.string().optional().describe("LinkedIn profile URL or ID"),
       email: z.string().optional().describe("Email address"),
