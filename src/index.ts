@@ -1125,61 +1125,122 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
     },
     async (params) => {
       try {
-      const query: Record<string, string> = {
-        limit: String(Math.min(params.limit ?? 300, 1000)),
-        "filter[type]": "inbox",
-        order_field: "created_at",
-        order_type: "desc",
-      };
-      if (params.sender_profile_uuid) query["filter[sender_profile_uuid]"] = params.sender_profile_uuid;
+        const scanLimit = String(Math.min(params.limit ?? 300, 1000));
 
-      const messagesResult = await grinfiRequest("GET", "/flows/api/linkedin-messages", undefined, query) as {
-        data?: Array<{ lead_uuid: string; text: string; created_at: string; sender_profile_uuid: string; linkedin_conversation_uuid: string; [key: string]: unknown }>;
-        total?: number;
-      };
+        // Fetch LinkedIn inbox and Email inbox in parallel
+        const linkedinQuery: Record<string, string> = {
+          limit: scanLimit,
+          "filter[type]": "inbox",
+          order_field: "created_at",
+          order_type: "desc",
+        };
+        if (params.sender_profile_uuid) linkedinQuery["filter[sender_profile_uuid]"] = params.sender_profile_uuid;
 
-      if (!messagesResult.data || messagesResult.data.length === 0) {
-        return jsonResult({ unread_conversations: [], total_unread: 0, note: "No inbox messages found" });
-      }
+        const emailQuery: Record<string, string> = {
+          limit: scanLimit,
+          type: "inbox",
+          order_field: "created_at",
+          order_type: "desc",
+        };
+        if (params.sender_profile_uuid) emailQuery.sender_profile_uuid = params.sender_profile_uuid;
 
-      const leadLatestMessage = new Map<string, (typeof messagesResult.data)[0]>();
-      for (const msg of messagesResult.data) {
-        if (!leadLatestMessage.has(msg.lead_uuid)) leadLatestMessage.set(msg.lead_uuid, msg);
-      }
+        const [linkedinResult, emailResult] = await Promise.all([
+          grinfiRequest("GET", "/flows/api/linkedin-messages", undefined, linkedinQuery) as Promise<{
+            data?: Array<{ lead_uuid: string; text: string; created_at: string; sender_profile_uuid: string; linkedin_conversation_uuid: string; [key: string]: unknown }>;
+            total?: number;
+          }>,
+          grinfiRequest("GET", "/emails/api/emails", undefined, emailQuery) as Promise<{
+            data?: Array<{ lead_uuid: string | null; from_name: string; from_email: string; subject: string; created_at: string; sender_profile_uuid: string | null; mailbox_uuid: string; [key: string]: unknown }>;
+            total?: number;
+          }>,
+        ]);
 
-      const unreadConversations: Array<{
-        contact_name: string; contact_uuid: string; unread_counts: unknown;
-        latest_message: string; latest_message_at: string;
-        sender_profile_uuid: string; conversation_uuid: string;
-      }> = [];
+        // Build map: lead_uuid -> latest message (LinkedIn or email)
+        const leadLatest = new Map<string, { text: string; created_at: string; sender_profile_uuid: string; channel: string; conversation_id: string }>();
 
-      for (const [leadUuid, latestMsg] of leadLatestMessage) {
-        try {
-          const leadData = await grinfiRequest("GET", `/leads/api/leads/${leadUuid}`) as {
-            lead?: { name?: string; unread_counts?: Array<{ count: number; channel: string; sender_profile_uuid: string }> };
-          };
-          const unreadCounts = leadData.lead?.unread_counts ?? [];
-          if (unreadCounts.length > 0 && unreadCounts.some((uc) => uc.count > 0)) {
-            unreadConversations.push({
-              contact_name: leadData.lead?.name ?? "Unknown",
-              contact_uuid: leadUuid,
-              unread_counts: unreadCounts,
-              latest_message: latestMsg.text,
-              latest_message_at: latestMsg.created_at,
-              sender_profile_uuid: latestMsg.sender_profile_uuid,
-              conversation_uuid: latestMsg.linkedin_conversation_uuid,
-            });
+        // LinkedIn messages
+        if (linkedinResult.data) {
+          for (const msg of linkedinResult.data) {
+            if (!msg.lead_uuid) continue;
+            if (!leadLatest.has(msg.lead_uuid)) {
+              leadLatest.set(msg.lead_uuid, {
+                text: msg.text,
+                created_at: msg.created_at,
+                sender_profile_uuid: msg.sender_profile_uuid,
+                channel: "linkedin",
+                conversation_id: msg.linkedin_conversation_uuid,
+              });
+            }
           }
-        } catch { /* skip individual lead fetch errors */ }
-      }
+        }
 
-      return jsonResult({
-        unread_conversations: unreadConversations,
-        total_unread: unreadConversations.length,
-        scanned_messages: messagesResult.data.length,
-        total_inbox_messages: messagesResult.total,
-        note: "Showing contacts with unread_counts > 0 from recent inbox messages",
-      });
+        // Email messages (only those linked to a lead)
+        if (emailResult.data) {
+          for (const email of emailResult.data) {
+            if (!email.lead_uuid) continue; // skip emails not linked to contacts
+            if (!leadLatest.has(email.lead_uuid)) {
+              leadLatest.set(email.lead_uuid, {
+                text: `[Email] ${email.subject || "(no subject)"} - from ${email.from_name || email.from_email}`,
+                created_at: email.created_at,
+                sender_profile_uuid: email.sender_profile_uuid || "",
+                channel: "email",
+                conversation_id: email.mailbox_uuid,
+              });
+            } else {
+              // Lead already found via LinkedIn - check if email is newer
+              const existing = leadLatest.get(email.lead_uuid)!;
+              if (email.created_at > existing.created_at) {
+                leadLatest.set(email.lead_uuid, {
+                  text: `[Email] ${email.subject || "(no subject)"} - from ${email.from_name || email.from_email}`,
+                  created_at: email.created_at,
+                  sender_profile_uuid: email.sender_profile_uuid || "",
+                  channel: "email",
+                  conversation_id: email.mailbox_uuid,
+                });
+              }
+            }
+          }
+        }
+
+        if (leadLatest.size === 0) {
+          return jsonResult({ unread_conversations: [], total_unread: 0, note: "No inbox messages found" });
+        }
+
+        // Fetch each contact and check unread_counts
+        const unreadConversations: Array<{
+          contact_name: string; contact_uuid: string; unread_counts: unknown;
+          latest_message: string; latest_message_at: string;
+          channel: string; sender_profile_uuid: string; conversation_id: string;
+        }> = [];
+
+        for (const [leadUuid, latest] of leadLatest) {
+          try {
+            const leadData = await grinfiRequest("GET", `/leads/api/leads/${leadUuid}`) as {
+              lead?: { name?: string; unread_counts?: Array<{ count: number; channel: string; sender_profile_uuid: string }> };
+            };
+            const unreadCounts = leadData.lead?.unread_counts ?? [];
+            if (unreadCounts.length > 0 && unreadCounts.some((uc) => uc.count > 0)) {
+              unreadConversations.push({
+                contact_name: leadData.lead?.name ?? "Unknown",
+                contact_uuid: leadUuid,
+                unread_counts: unreadCounts,
+                latest_message: latest.text,
+                latest_message_at: latest.created_at,
+                channel: latest.channel,
+                sender_profile_uuid: latest.sender_profile_uuid,
+                conversation_id: latest.conversation_id,
+              });
+            }
+          } catch { /* skip individual lead fetch errors */ }
+        }
+
+        return jsonResult({
+          unread_conversations: unreadConversations,
+          total_unread: unreadConversations.length,
+          scanned_linkedin_messages: linkedinResult.data?.length ?? 0,
+          scanned_emails: emailResult.data?.filter((e) => e.lead_uuid).length ?? 0,
+          note: "Showing contacts with unread_counts > 0 from recent LinkedIn and email inbox",
+        });
       } catch (err) {
         return jsonResult({ error: `Failed to fetch unread conversations: ${err instanceof Error ? err.message : String(err)}` });
       }
