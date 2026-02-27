@@ -263,7 +263,7 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
 
   server.tool(
     "update_contact",
-    "Update a contact's fields by UUID. To change pipeline stage, use change_contact_pipeline_stage tool instead.",
+    "Update a contact's fields by UUID. To change pipeline stage, use change_contact_pipeline_stage tool instead. Use work_email for business email and personal_email for personal email.",
     {
       uuid: z.string().describe("UUID of the contact to update"),
       first_name: z.string().optional().describe("First name"),
@@ -272,7 +272,8 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
       ln_id: z.string().optional().describe("LinkedIn member ID"),
       sn_id: z.string().optional().describe("Sales Navigator ID"),
       linkedin: z.string().optional().describe("LinkedIn profile handle"),
-      email: z.string().optional().describe("Email address"),
+      work_email: z.string().optional().describe("Work/business email address"),
+      personal_email: z.string().optional().describe("Personal email address"),
       about: z.string().optional().describe("Description / about text"),
       domain: z.string().optional().describe("Company domain for email finding"),
       headline: z.string().optional().describe("LinkedIn headline"),
@@ -1260,19 +1261,31 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
     return jsonResult(result);
   });
 
-  server.tool("send_email", "Send an email to a contact.", {
-    sender_profile_uuid: z.string(), lead_uuid: z.string(),
-    from_name: z.string(), from_email: z.string(),
-    to_name: z.string(), to_email: z.string(), subject: z.string(),
-    cc: z.array(z.string()).optional(), bcc: z.array(z.string()).optional(),
+  server.tool("send_email", "Send an email to a contact. Requires mailbox_uuid (use list_mailboxes to find it) and body (HTML content). The to field is an array of recipients [{to_email, to_name}].", {
+    sender_profile_uuid: z.string().describe("UUID of the sender profile"),
+    lead_uuid: z.string().describe("UUID of the contact (lead)"),
+    mailbox_uuid: z.string().describe("UUID of the sending mailbox (use list_mailboxes to find)"),
+    from_name: z.string().describe("Sender display name"),
+    from_email: z.string().describe("Sender email address"),
+    to: z.array(z.object({
+      to_email: z.string().describe("Recipient email address"),
+      to_name: z.string().optional().describe("Recipient name"),
+    })).describe("Array of recipients [{to_email, to_name}]"),
+    subject: z.string().describe("Email subject line"),
+    body: z.string().describe("Email body in HTML format (e.g. '<p>Hello!</p>')"),
+    cc: z.array(z.string()).optional().describe("CC email addresses"),
+    bcc: z.array(z.string()).optional().describe("BCC email addresses"),
+    attachments: z.array(z.object({ uuid: z.string(), name: z.string() })).optional().describe("Array of attachment objects {uuid, name} from upload_attachment"),
   }, async (params) => {
     const body: Record<string, unknown> = {
       sender_profile_uuid: params.sender_profile_uuid, lead_uuid: params.lead_uuid,
+      mailbox_uuid: params.mailbox_uuid,
       from_name: params.from_name, from_email: params.from_email,
-      to_name: params.to_name, to_email: params.to_email, subject: params.subject,
+      to: params.to, subject: params.subject, body: params.body,
     };
     if (params.cc) body.cc = params.cc;
     if (params.bcc) body.bcc = params.bcc;
+    if (params.attachments && params.attachments.length > 0) body.attachments = params.attachments;
     const result = await grinfiRequest("POST", "/emails/api/emails/send-email", body);
     return jsonResult(result);
   });
