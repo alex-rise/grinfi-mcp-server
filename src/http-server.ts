@@ -227,7 +227,9 @@ function createMcpServer(): McpServer {
 
   server.tool(
     "search_contacts",
-    `Search contacts with filters, sorting, and pagination. Filter supports: scalar values (equals), arrays (IN), objects with operators (>=, <=, >, <, =, !=, <>), 'is_null', 'is_not_null'.
+    `Search contacts by name, company, or filter criteria. If you already have a UUID — use get_contact instead. If you have a LinkedIn URL or email — use find_contact instead.
+
+Filter supports: scalar values (equals), arrays (IN), objects with operators (>=, <=, >, <, =, !=, <>), 'is_null', 'is_not_null'.
 
 IMPORTANT: To search by name, company, or any text — use filter.q (e.g. filter: {q: "John Doe"}).
 Text fields like first_name, last_name, name, company_name do NOT work as direct filters.
@@ -256,14 +258,14 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
     }
   );
 
-  server.tool("get_contact", "Get a contact by their UUID.", { uuid: z.string().describe("UUID of the contact") }, async (params) => {
+  server.tool("get_contact", "Get a contact by UUID. ALWAYS use this when UUID is already known — never search again by name/email if you have the UUID.", { uuid: z.string().describe("UUID of the contact") }, async (params) => {
     const result = await grinfiRequest("GET", `/leads/api/leads/${params.uuid}`);
     return jsonResult(result, true);
   });
 
   server.tool(
     "update_contact",
-    "Update a contact's fields by UUID. To change pipeline stage, use change_contact_pipeline_stage tool instead. Use work_email for business email and personal_email for personal email.",
+    "Update a contact's fields by UUID. Does NOT support pipeline_stage_uuid — use change_contact_pipeline_stage for that. Use work_email for business email and personal_email for personal email (not 'email').",
     {
       uuid: z.string().describe("UUID of the contact to update"),
       first_name: z.string().optional().describe("First name"),
@@ -322,7 +324,7 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
 
   server.tool(
     "change_contact_pipeline_stage",
-    "Change the pipeline stage of one or more contacts. Use list_pipeline_stages to get available stage UUIDs first.",
+    "Change the pipeline stage of one or more contacts (up to ~10). Use list_pipeline_stages first to get valid stage UUIDs — never guess them. For bulk changes on 10+ contacts, use leads_mass_action with type 'contact_change_pipeline_stage' instead.",
     {
       contact_uuids: z.array(z.string()).describe("Array of contact UUIDs to change"),
       pipeline_stage_uuid: z.string().describe("UUID of the target pipeline stage"),
@@ -339,7 +341,7 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
 
   server.tool(
     "leads_mass_action",
-    "Perform a mass action on leads. Types: contact_change_pipeline_stage, contact_mark_read, etc. For pipeline stage changes prefer change_contact_pipeline_stage tool.",
+    "Perform a mass action on many leads at once. Use ONLY for bulk operations on 10+ contacts — for 1-5 contacts use individual tools (change_contact_pipeline_stage, update_contact, etc.). Types and payloads: contact_change_pipeline_stage (payload: {pipeline_stage_uuid}), contact_assign_tag (payload: {tag_uuid}), contact_remove_tag (payload: {tag_uuid}), contact_move_to_list (payload: {list_uuid}), contact_delete (no payload), contact_mark_read (no payload). Filter: {ids: ['uuid1','uuid2']} for specific contacts or {all: true} for all.",
     {
       type: z.string().describe("Mass action type (e.g. 'contact_change_pipeline_stage', 'contact_mark_read')"),
       filter: z.record(z.string(), z.unknown()).describe("Filter to select leads"),
@@ -488,7 +490,7 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
 
   server.tool(
     "companies_mass_action",
-    "Perform a mass action on companies. Types: assign_tag, remove_tag, move_to_list, change_pipeline_stage, delete, etc.",
+    "Perform a mass action on many companies at once. Use ONLY for bulk operations on 10+ companies — for 1-5 use individual tools. Types: assign_tag, remove_tag, move_to_list, change_pipeline_stage, delete. Filter: {ids: ['uuid1','uuid2']} or {all: true}. Payload depends on type (e.g. {pipeline_stage_uuid: '...'} for change_pipeline_stage, {tag_uuid: '...'} for assign/remove tag).",
     {
       type: z.string().describe("Mass action type"),
       filter: z.record(z.string(), z.unknown()).describe("Filter to select companies"),
@@ -985,7 +987,7 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
 
   server.tool(
     "create_task",
-    "Create a new task (e.g. send LinkedIn message) for a contact. The task is scheduled and will be executed by the automation system. Requires lead_uuid, sender_profile_uuid, message text, and schedule time.",
+    "SCHEDULE an action for the future — does NOT execute immediately. To send a LinkedIn message right now, use send_linkedin_message instead. Creates a manual task that will be executed at schedule_at time. Known task types: linkedin_send_message (default), linkedin_send_connection_request, linkedin_send_inmail, linkedin_like_latest_post, linkedin_endorse_skills.",
     {
       lead_uuid: z.string().describe("UUID of the contact (lead)"),
       sender_profile_uuid: z.string().describe("UUID of the sender profile to execute the task"),
@@ -1202,7 +1204,7 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
     return jsonResult(result);
   });
 
-  server.tool("send_linkedin_message", "Send a LinkedIn message to a contact. Set linkedin_messenger_type to 'sn' for InMail (requires subject). Use 'basic' (default) for regular LinkedIn message. To attach files, first upload them with upload_attachment, then pass their UUIDs and names in the attachments array.", {
+  server.tool("send_linkedin_message", "Send a LinkedIn message to a contact IMMEDIATELY (right now). To schedule a message for later, use create_task instead. Set linkedin_messenger_type to 'sn' for InMail (requires subject). Use 'basic' (default) for regular LinkedIn message. To attach files, first upload them with upload_attachment, then pass their UUIDs and names in the attachments array.", {
     sender_profile_uuid: z.string(), lead_uuid: z.string(), text: z.string(),
     template_uuid: z.string().optional(),
     linkedin_messenger_type: z.enum(["basic", "sn"]).optional().default("basic").describe("'basic' for regular LinkedIn message, 'sn' for InMail"),
@@ -1254,7 +1256,7 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
     return jsonResult(result);
   });
 
-  server.tool("get_email", "Get a specific email by UUID. Returns full email details including from/to, subject, status, timestamps.", {
+  server.tool("get_email", "Get email metadata by UUID: from/to addresses, subject, status, timestamps. Does NOT include the email HTML body — use get_email_body with the email_body_uuid from this response to get content.", {
     uuid: z.string().describe("UUID of the email"),
   }, async (params) => {
     const result = await grinfiRequest("GET", `/emails/api/emails/${params.uuid}`);
@@ -1295,7 +1297,7 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
     return jsonResult(result);
   });
 
-  server.tool("get_email_body", "Get an email body (HTML content, subject, attachments) by UUID.", {
+  server.tool("get_email_body", "Get email HTML content and attachments by email_body_uuid. First call get_email to get the email_body_uuid, then use this tool to read the actual email content.", {
     uuid: z.string().describe("UUID of the email body"),
   }, async (params) => {
     const result = await grinfiRequest("GET", `/emails/api/email-bodies/${params.uuid}`);
@@ -1311,7 +1313,7 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
     return jsonResult(result);
   });
 
-  server.tool("get_email_thread", "Render the email conversation thread for a reply email.", {
+  server.tool("get_email_thread", "Render the email conversation thread for a reply email. Returns formatted HTML thread. Use when you need the raw thread for a specific reply.", {
     reply_to_email_uuid: z.string().describe("UUID of the reply email to render thread for"),
   }, async (params) => {
     const result = await grinfiRequest("GET", `/emails/api/emails/${params.reply_to_email_uuid}/thread`);
@@ -1320,7 +1322,7 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
 
   server.tool(
     "get_email_llm_thread",
-    "Get an email conversation thread formatted for LLM processing. Optimized for AI analysis and response generation.",
+    "Get an email conversation thread optimized for AI analysis. Returns clean text format — use this when you need to understand the email conversation history before composing a reply.",
     {
       sender_profile_uuid: z.string().describe("UUID of the sender profile"),
       lead_uuid: z.string().describe("UUID of the contact"),
