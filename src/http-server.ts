@@ -324,7 +324,7 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
 
   server.tool(
     "change_contact_pipeline_stage",
-    "Change the pipeline stage of one or more contacts (up to ~10). Use list_pipeline_stages first to get valid stage UUIDs — never guess them. For bulk changes on 10+ contacts, use leads_mass_action with type 'contact_change_pipeline_stage' instead.",
+    "Change the pipeline stage of one or more contacts. Use list_pipeline_stages to get valid stage UUIDs. Also available as leads_mass_action with type 'contact_change_pipeline_stage'.",
     {
       contact_uuids: z.array(z.string()).describe("Array of contact UUIDs to change"),
       pipeline_stage_uuid: z.string().describe("UUID of the target pipeline stage"),
@@ -341,7 +341,7 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
 
   server.tool(
     "leads_mass_action",
-    "Perform a mass action on many leads at once. Use ONLY for bulk operations on 10+ contacts — for 1-5 contacts use individual tools (change_contact_pipeline_stage, update_contact, etc.). Types and payloads: contact_change_pipeline_stage (payload: {pipeline_stage_uuid}), contact_assign_tag (payload: {tag_uuid}), contact_remove_tag (payload: {tag_uuid}), contact_move_to_list (payload: {list_uuid}), contact_delete (no payload), contact_mark_read (no payload). Filter: {ids: ['uuid1','uuid2']} for specific contacts or {all: true} for all.",
+    "Perform a mass action on leads. Actions ONLY available here (no separate tool): contact_assign_tag (payload: {tag_uuid}), contact_remove_tag (payload: {tag_uuid}), contact_move_to_list (payload: {list_uuid}). Actions that also have separate tools: contact_mark_read (no payload) - also see mark_conversation_as_read, contact_change_pipeline_stage (payload: {pipeline_stage_uuid}) - also see change_contact_pipeline_stage, contact_delete (no payload) - also see delete_contact. Filter: {ids: ['uuid1','uuid2']} for specific contacts or {all: true} for all matching.",
     {
       type: z.string().describe("Mass action type (e.g. 'contact_change_pipeline_stage', 'contact_mark_read')"),
       filter: z.record(z.string(), z.unknown()).describe("Filter to select leads"),
@@ -490,7 +490,7 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
 
   server.tool(
     "companies_mass_action",
-    "Perform a mass action on many companies at once. Use ONLY for bulk operations on 10+ companies — for 1-5 use individual tools. Types: assign_tag, remove_tag, move_to_list, change_pipeline_stage, delete. Filter: {ids: ['uuid1','uuid2']} or {all: true}. Payload depends on type (e.g. {pipeline_stage_uuid: '...'} for change_pipeline_stage, {tag_uuid: '...'} for assign/remove tag).",
+    "Perform a mass action on companies. Types: assign_tag (payload: {tag_uuid}), remove_tag (payload: {tag_uuid}), move_to_list (payload: {list_uuid}), change_pipeline_stage (payload: {pipeline_stage_uuid}), delete (no payload). Filter: {ids: ['uuid1','uuid2']} for specific companies or {all: true} for all matching.",
     {
       type: z.string().describe("Mass action type"),
       filter: z.record(z.string(), z.unknown()).describe("Filter to select companies"),
@@ -1136,61 +1136,65 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
       sender_profile_uuid: z.string().optional().describe("Filter by sender profile UUID"),
     },
     async (params) => {
-      const query: Record<string, string> = {
-        limit: String(Math.min(params.limit ?? 300, 1000)),
-        "filter[type]": "inbox",
-        order_field: "created_at",
-        order_type: "desc",
-      };
-      if (params.sender_profile_uuid) query["filter[sender_profile_uuid]"] = params.sender_profile_uuid;
+      try {
+        const query: Record<string, string> = {
+          limit: String(Math.min(params.limit ?? 300, 1000)),
+          "filter[type]": "inbox",
+          order_field: "created_at",
+          order_type: "desc",
+        };
+        if (params.sender_profile_uuid) query["filter[sender_profile_uuid]"] = params.sender_profile_uuid;
 
-      const messagesResult = await grinfiRequest("GET", "/flows/api/linkedin-messages", undefined, query) as {
-        data?: Array<{ lead_uuid: string; text: string; created_at: string; sender_profile_uuid: string; linkedin_conversation_uuid: string; [key: string]: unknown }>;
-        total?: number;
-      };
+        const messagesResult = await grinfiRequest("GET", "/flows/api/linkedin-messages", undefined, query) as {
+          data?: Array<{ lead_uuid: string; text: string; created_at: string; sender_profile_uuid: string; linkedin_conversation_uuid: string; [key: string]: unknown }>;
+          total?: number;
+        };
 
-      if (!messagesResult.data || messagesResult.data.length === 0) {
-        return jsonResult({ unread_conversations: [], total_unread: 0, note: "No inbox messages found" });
+        if (!messagesResult.data || messagesResult.data.length === 0) {
+          return jsonResult({ unread_conversations: [], total_unread: 0, note: "No inbox messages found" });
+        }
+
+        const leadLatestMessage = new Map<string, (typeof messagesResult.data)[0]>();
+        for (const msg of messagesResult.data) {
+          if (!leadLatestMessage.has(msg.lead_uuid)) leadLatestMessage.set(msg.lead_uuid, msg);
+        }
+
+        const unreadConversations: Array<{
+          contact_name: string; contact_uuid: string; unread_counts: unknown;
+          latest_message: string; latest_message_at: string;
+          sender_profile_uuid: string; conversation_uuid: string;
+        }> = [];
+
+        for (const [leadUuid, latestMsg] of leadLatestMessage) {
+          try {
+            const leadData = await grinfiRequest("GET", `/leads/api/leads/${leadUuid}`) as {
+              lead?: { name?: string; unread_counts?: Array<{ count: number; channel: string; sender_profile_uuid: string }> };
+            };
+            const unreadCounts = leadData.lead?.unread_counts ?? [];
+            if (unreadCounts.length > 0 && unreadCounts.some((uc) => uc.count > 0)) {
+              unreadConversations.push({
+                contact_name: leadData.lead?.name ?? "Unknown",
+                contact_uuid: leadUuid,
+                unread_counts: unreadCounts,
+                latest_message: latestMsg.text,
+                latest_message_at: latestMsg.created_at,
+                sender_profile_uuid: latestMsg.sender_profile_uuid,
+                conversation_uuid: latestMsg.linkedin_conversation_uuid,
+              });
+            }
+          } catch { /* skip individual lead fetch errors */ }
+        }
+
+        return jsonResult({
+          unread_conversations: unreadConversations,
+          total_unread: unreadConversations.length,
+          scanned_messages: messagesResult.data.length,
+          total_inbox_messages: messagesResult.total,
+          note: "Showing contacts with unread_counts > 0 from recent inbox messages",
+        });
+      } catch (err) {
+        return jsonResult({ error: `Failed to fetch unread conversations: ${err instanceof Error ? err.message : String(err)}` });
       }
-
-      const leadLatestMessage = new Map<string, (typeof messagesResult.data)[0]>();
-      for (const msg of messagesResult.data) {
-        if (!leadLatestMessage.has(msg.lead_uuid)) leadLatestMessage.set(msg.lead_uuid, msg);
-      }
-
-      const unreadConversations: Array<{
-        contact_name: string; contact_uuid: string; unread_counts: unknown;
-        latest_message: string; latest_message_at: string;
-        sender_profile_uuid: string; conversation_uuid: string;
-      }> = [];
-
-      for (const [leadUuid, latestMsg] of leadLatestMessage) {
-        try {
-          const leadData = await grinfiRequest("GET", `/leads/api/leads/${leadUuid}`) as {
-            lead?: { name?: string; unread_counts?: Array<{ count: number; channel: string; sender_profile_uuid: string }> };
-          };
-          const unreadCounts = leadData.lead?.unread_counts ?? [];
-          if (unreadCounts.length > 0 && unreadCounts.some((uc) => uc.count > 0)) {
-            unreadConversations.push({
-              contact_name: leadData.lead?.name ?? "Unknown",
-              contact_uuid: leadUuid,
-              unread_counts: unreadCounts,
-              latest_message: latestMsg.text,
-              latest_message_at: latestMsg.created_at,
-              sender_profile_uuid: latestMsg.sender_profile_uuid,
-              conversation_uuid: latestMsg.linkedin_conversation_uuid,
-            });
-          }
-        } catch { /* skip */ }
-      }
-
-      return jsonResult({
-        unread_conversations: unreadConversations,
-        total_unread: unreadConversations.length,
-        scanned_messages: messagesResult.data.length,
-        total_inbox_messages: messagesResult.total,
-        note: "Showing contacts with unread_counts > 0 from recent inbox messages",
-      });
     }
   );
 

@@ -312,7 +312,7 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
 
   server.tool(
     "change_contact_pipeline_stage",
-    "Change the pipeline stage of one or more contacts (up to ~10). Use list_pipeline_stages first to get valid stage UUIDs — never guess them. For bulk changes on 10+ contacts, use leads_mass_action with type 'contact_change_pipeline_stage' instead.",
+    "Change the pipeline stage of one or more contacts. Use list_pipeline_stages to get valid stage UUIDs. Also available as leads_mass_action with type 'contact_change_pipeline_stage'.",
     {
       contact_uuids: z.array(z.string()).describe("Array of contact UUIDs to change"),
       pipeline_stage_uuid: z.string().describe("UUID of the target pipeline stage"),
@@ -329,7 +329,7 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
 
   server.tool(
     "leads_mass_action",
-    "Perform a mass action on many leads at once. Use ONLY for bulk operations on 10+ contacts — for 1-5 contacts use individual tools (change_contact_pipeline_stage, update_contact, etc.). Types and payloads: contact_change_pipeline_stage (payload: {pipeline_stage_uuid}), contact_assign_tag (payload: {tag_uuid}), contact_remove_tag (payload: {tag_uuid}), contact_move_to_list (payload: {list_uuid}), contact_delete (no payload), contact_mark_read (no payload). Filter: {ids: ['uuid1','uuid2']} for specific contacts or {all: true} for all.",
+    "Perform a mass action on leads. Actions ONLY available here (no separate tool): contact_assign_tag (payload: {tag_uuid}), contact_remove_tag (payload: {tag_uuid}), contact_move_to_list (payload: {list_uuid}). Actions that also have separate tools: contact_mark_read (no payload) - also see mark_conversation_as_read, contact_change_pipeline_stage (payload: {pipeline_stage_uuid}) - also see change_contact_pipeline_stage, contact_delete (no payload) - also see delete_contact. Filter: {ids: ['uuid1','uuid2']} for specific contacts or {all: true} for all matching.",
     {
       type: z.string().describe("Mass action type (e.g. 'contact_change_pipeline_stage', 'contact_mark_read')"),
       filter: z.record(z.string(), z.unknown()).describe("Filter to select leads"),
@@ -478,7 +478,7 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
 
   server.tool(
     "companies_mass_action",
-    "Perform a mass action on many companies at once. Use ONLY for bulk operations on 10+ companies — for 1-5 use individual tools. Types: assign_tag, remove_tag, move_to_list, change_pipeline_stage, delete. Filter: {ids: ['uuid1','uuid2']} or {all: true}. Payload depends on type (e.g. {pipeline_stage_uuid: '...'} for change_pipeline_stage, {tag_uuid: '...'} for assign/remove tag).",
+    "Perform a mass action on companies. Types: assign_tag (payload: {tag_uuid}), remove_tag (payload: {tag_uuid}), move_to_list (payload: {list_uuid}), change_pipeline_stage (payload: {pipeline_stage_uuid}), delete (no payload). Filter: {ids: ['uuid1','uuid2']} for specific companies or {all: true} for all matching.",
     {
       type: z.string().describe("Mass action type"),
       filter: z.record(z.string(), z.unknown()).describe("Filter to select companies"),
@@ -1124,6 +1124,7 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
       sender_profile_uuid: z.string().optional().describe("Filter by sender profile UUID"),
     },
     async (params) => {
+      try {
       const query: Record<string, string> = {
         limit: String(Math.min(params.limit ?? 300, 1000)),
         "filter[type]": "inbox",
@@ -1169,7 +1170,7 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
               conversation_uuid: latestMsg.linkedin_conversation_uuid,
             });
           }
-        } catch { /* skip */ }
+        } catch { /* skip individual lead fetch errors */ }
       }
 
       return jsonResult({
@@ -1179,6 +1180,9 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
         total_inbox_messages: messagesResult.total,
         note: "Showing contacts with unread_counts > 0 from recent inbox messages",
       });
+      } catch (err) {
+        return jsonResult({ error: `Failed to fetch unread conversations: ${err instanceof Error ? err.message : String(err)}` });
+      }
     }
   );
 
