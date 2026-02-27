@@ -1058,29 +1058,61 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
   server.tool("mass_cancel_tasks", "Cancel multiple MANUAL tasks at once. Do NOT use for automatic (automation-created) tasks.", {
     uuids: z.array(z.string()).describe("Array of manual task UUIDs to cancel"),
   }, async (params) => {
-    const result = await grinfiRequest("PUT", "/flows/api/tasks/mass-cancel", { uuids: params.uuids });
-    return jsonResult(result);
+    const results: Array<{ uuid: string; status: string }> = [];
+    for (const uuid of params.uuids) {
+      try {
+        await grinfiRequest("PUT", `/flows/api/tasks/${uuid}/cancel`);
+        results.push({ uuid, status: "cancelled" });
+      } catch (err) {
+        results.push({ uuid, status: `error: ${err instanceof Error ? err.message : String(err)}` });
+      }
+    }
+    return jsonResult({ results, total: params.uuids.length, success: results.filter((r) => r.status === "cancelled").length });
   });
 
   server.tool("mass_complete_tasks", "Mark multiple MANUAL tasks as completed at once. Do NOT use for automatic (automation-created) tasks.", {
     uuids: z.array(z.string()).describe("Array of manual task UUIDs to complete"),
   }, async (params) => {
-    const result = await grinfiRequest("PUT", "/flows/api/tasks/mass-complete", { uuids: params.uuids });
-    return jsonResult(result);
+    const results: Array<{ uuid: string; status: string }> = [];
+    for (const uuid of params.uuids) {
+      try {
+        await grinfiRequest("PUT", `/flows/api/tasks/${uuid}/complete`);
+        results.push({ uuid, status: "completed" });
+      } catch (err) {
+        results.push({ uuid, status: `error: ${err instanceof Error ? err.message : String(err)}` });
+      }
+    }
+    return jsonResult({ results, total: params.uuids.length, success: results.filter((r) => r.status === "completed").length });
   });
 
   server.tool("mass_retry_tasks", "Retry multiple failed MANUAL tasks at once. Do NOT use for automatic (automation-created) tasks.", {
     uuids: z.array(z.string()).describe("Array of manual task UUIDs to retry"),
   }, async (params) => {
-    const result = await grinfiRequest("PUT", "/flows/api/tasks/mass-retry", { uuids: params.uuids });
-    return jsonResult(result);
+    const results: Array<{ uuid: string; status: string }> = [];
+    for (const uuid of params.uuids) {
+      try {
+        await grinfiRequest("PUT", `/flows/api/tasks/${uuid}/retry`);
+        results.push({ uuid, status: "retried" });
+      } catch (err) {
+        results.push({ uuid, status: `error: ${err instanceof Error ? err.message : String(err)}` });
+      }
+    }
+    return jsonResult({ results, total: params.uuids.length, success: results.filter((r) => r.status === "retried").length });
   });
 
   server.tool("mass_skip_tasks", "Skip multiple MANUAL tasks at once. Do NOT use for automatic (automation-created) tasks.", {
     uuids: z.array(z.string()).describe("Array of manual task UUIDs to skip"),
   }, async (params) => {
-    const result = await grinfiRequest("PUT", "/flows/api/tasks/mass-skip", { uuids: params.uuids });
-    return jsonResult(result);
+    const results: Array<{ uuid: string; status: string }> = [];
+    for (const uuid of params.uuids) {
+      try {
+        await grinfiRequest("PUT", `/flows/api/tasks/${uuid}/skip`);
+        results.push({ uuid, status: "skipped" });
+      } catch (err) {
+        results.push({ uuid, status: `error: ${err instanceof Error ? err.message : String(err)}` });
+      }
+    }
+    return jsonResult({ results, total: params.uuids.length, success: results.filter((r) => r.status === "skipped").length });
   });
 
   server.tool(
