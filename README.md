@@ -27,11 +27,10 @@ git clone https://github.com/alex-rise/grinfi-mcp-server.git
 
 ### Option A: Use the installer (recommended)
 
-1. Open **Terminal** (press `Cmd + Space`, type **Terminal**, press Enter)
-2. Type `bash ` (with a space after it)
-3. **Drag the `install.sh` file** from Finder into the Terminal window — the path fills in automatically
-4. Press **Enter**
-5. When prompted, paste your **Grinfi API key** and press Enter
+1. Open the **grinfi-mcp-server** folder in Finder
+2. **Double-click `install-mac.command`**
+3. If macOS shows a security warning, go to **System Settings → Privacy & Security** and click **"Open Anyway"**
+4. When prompted, paste your **Grinfi API key** and press Enter
 
 The installer will automatically:
 - Install **Homebrew** (if not installed)
@@ -235,7 +234,12 @@ npm run build
 
 ### Installer won't start (Mac)
 
-Make sure you typed `bash ` (with a space) before dragging the file. The full command should look like:
+Double-click **`install-mac.command`** (not `install.sh`). If macOS blocks it:
+1. Go to **System Settings → Privacy & Security**
+2. Scroll down — you'll see a message about the blocked file
+3. Click **"Open Anyway"**
+
+Alternatively, open Terminal and run:
 ```
 bash /Users/yourname/Documents/grinfi-mcp-server/install.sh
 ```
