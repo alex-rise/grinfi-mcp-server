@@ -188,21 +188,6 @@ JSONEOF4
     fi
 fi
 
-# ----- Install Claude Code skill -----
-echo ""
-echo -e "${BOLD}Installing Claude Code skill...${NC}"
-
-SKILL_SOURCE="$SCRIPT_DIR/SKILL.md"
-SKILL_DIR="$HOME/.claude/skills/grinfi-mcp"
-
-if [ -f "$SKILL_SOURCE" ]; then
-    mkdir -p "$SKILL_DIR"
-    cp "$SKILL_SOURCE" "$SKILL_DIR/SKILL.md"
-    echo -e "${GREEN}OK${NC} Skill installed to ${CYAN}$SKILL_DIR/SKILL.md${NC}"
-else
-    echo -e "${YELLOW}SKILL.md not found - skipping skill install${NC}"
-fi
-
 # ----- Done -----
 echo ""
 echo -e "${GREEN}${BOLD}========================================${NC}"
