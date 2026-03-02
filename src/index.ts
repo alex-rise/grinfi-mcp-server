@@ -271,7 +271,7 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
 
   server.tool(
     "update_contact",
-    "Update a contact's fields by UUID. Does NOT support pipeline_stage_uuid — use change_contact_pipeline_stage for that. Use work_email for business email and personal_email for personal email (not 'email').",
+    "Update a contact's fields by UUID. WARNING: pipeline_stage_uuid is silently ignored here — MUST use change_contact_pipeline_stage instead. Use work_email for business email and personal_email for personal email (not 'email').",
     {
       uuid: z.string().describe("UUID of the contact to update"),
       first_name: z.string().optional().describe("First name"),
@@ -977,12 +977,12 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
     return jsonResult(result);
   });
 
-  server.tool("cancel_contact_from_all_automations", "Cancel a contact from ALL active automations.", { lead_uuid: z.string() }, async (params) => {
+  server.tool("cancel_contact_from_all_automations", "Remove contact from ALL active automations permanently. Use after: sending manual reply, rejection, not-ICP classification. MUST call before sending manual messages to prevent conflicting automation messages.", { lead_uuid: z.string() }, async (params) => {
     const result = await grinfiRequest("PUT", `/flows/api/flows/leads/${params.lead_uuid}/cancel-all`);
     return jsonResult(result);
   });
 
-  server.tool("continue_automation", "Continue (resume) an automation for a specific contact.", { lead_uuid: z.string() }, async (params) => {
+  server.tool("continue_automation", "Resume a paused automation for a contact. Use only for neutral/early replies (e.g. 'ok', 'thanks' at 1-3 messages). Do NOT use if lead replied with interest, rejection, or after manual reply was sent.", { lead_uuid: z.string() }, async (params) => {
     const result = await grinfiRequest("PUT", "/flows/api/tasks/continue-automation", { lead_uuid: params.lead_uuid });
     return jsonResult(result);
   });
@@ -1150,11 +1150,11 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
 
   server.tool(
     "list_linkedin_messages",
-    "List LinkedIn messages from the unified inbox. Supports filters, pagination, and sorting. Set type to 'inbox' for received messages, 'outbox' for sent. For UNREAD conversations, use the 'get_unread_conversations' tool instead.",
+    "List LinkedIn messages from the unified inbox. Returns messages from ALL sender profiles by default — no need to call per sender profile. Set type to 'inbox' for received, 'outbox' for sent. Use order_field='sent_at', order_type='asc' for chronological conversation. For UNREAD conversations, use 'get_unread_conversations' instead.",
     {
       limit: z.number().optional(), offset: z.number().optional(),
       order_field: z.string().optional(), order_type: z.enum(["asc", "desc"]).optional(),
-      search: z.string().optional(), lead_uuid: z.string().optional(),
+      lead_uuid: z.string().optional(),
       sender_profile_uuid: z.string().optional(), linkedin_account_uuid: z.string().optional(),
       linkedin_conversation_uuid: z.string().optional(),
       status: z.string().optional(), type: z.string().optional(), user_id: z.string().optional(),
@@ -1318,7 +1318,7 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
     return jsonResult(result);
   });
 
-  server.tool("send_linkedin_message", "Send a LinkedIn message to a contact IMMEDIATELY (right now). To schedule a message for later, use create_task instead. Set linkedin_messenger_type to 'sn' for InMail (requires subject). Use 'basic' (default) for regular LinkedIn message. To attach files, first upload them with upload_attachment, then pass their UUIDs and names in the attachments array.", {
+  server.tool("send_linkedin_message", "Send a LinkedIn message to a contact IMMEDIATELY (right now). IMPORTANT: Always draft the message and get user confirmation before sending. To schedule for later, use create_task. Set linkedin_messenger_type to 'sn' for InMail (requires subject), 'basic' (default) for regular message. To attach files, first upload with upload_attachment, then pass UUIDs in attachments array.", {
     sender_profile_uuid: z.string(), lead_uuid: z.string(), text: z.string(),
     template_uuid: z.string().optional(),
     linkedin_messenger_type: z.enum(["basic", "sn"]).optional().default("basic").describe("'basic' for regular LinkedIn message, 'sn' for InMail"),
@@ -1540,7 +1540,6 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
   server.tool("list_mailbox_errors", "List mailbox errors for debugging. Shows send/sync errors with timestamps and details.", {
     limit: z.number().optional(), offset: z.number().optional(),
     order_field: z.string().optional(), order_type: z.enum(["asc", "desc"]).optional(),
-    search: z.string().optional(),
   }, async (params) => {
     const result = await grinfiRequest("GET", "/emails/api/mailbox-errors", undefined, buildQuery(params));
     return jsonResult(result);
