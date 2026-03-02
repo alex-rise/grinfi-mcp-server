@@ -187,6 +187,24 @@ function createMcpServer(): McpServer {
     instructions ? { instructions } : undefined
   );
 
+  // Wrap server.tool to catch unhandled errors in any handler
+  const originalTool = server.tool.bind(server);
+  server.tool = ((...args: unknown[]) => {
+    // Find the handler function (last argument)
+    const handlerIndex = args.length - 1;
+    const originalHandler = args[handlerIndex] as (...a: unknown[]) => Promise<unknown>;
+    args[handlerIndex] = async (...handlerArgs: unknown[]) => {
+      try {
+        return await originalHandler(...handlerArgs);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        console.error(`Tool error: ${message}`);
+        return { content: [{ type: "text" as const, text: JSON.stringify({ error: message }) }] };
+      }
+    };
+    return (originalTool as (...a: unknown[]) => unknown)(...args);
+  }) as typeof server.tool;
+
   // ===========================
   // CONTACTS
   // ===========================
@@ -1776,6 +1794,14 @@ async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }
+
+// Prevent process crashes from killing MCP connection
+process.on("uncaughtException", (err) => {
+  console.error("Uncaught exception (kept alive):", err.message);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("Unhandled rejection (kept alive):", reason);
+});
 
 main().catch((error) => {
   console.error("Failed to start Grinfi MCP server:", error);
