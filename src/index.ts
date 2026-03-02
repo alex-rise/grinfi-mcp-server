@@ -1176,7 +1176,7 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
     async (params) => {
       try {
         const query: Record<string, string> = {
-          limit: String(Math.min(params.limit ?? 70, 1000)),
+          limit: String(Math.min(params.limit ?? 300, 1000)),
           "filter[type]": "inbox",
           order_field: "created_at",
           order_type: "desc",
@@ -1206,7 +1206,7 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
         }> = [];
 
         const entries = Array.from(leadLatestMessage.entries());
-        const BATCH_SIZE = 20;
+        const BATCH_SIZE = 50;
         for (let i = 0; i < entries.length; i += BATCH_SIZE) {
           const batch = entries.slice(i, i + BATCH_SIZE);
           const results = await Promise.allSettled(
