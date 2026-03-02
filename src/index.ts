@@ -77,38 +77,6 @@ async function grinfiRequest(
   }
 }
 
-
-async function grinfiUpload(
-  path: string,
-  fileBuffer: Buffer,
-  fileName: string,
-  mimeType: string,
-): Promise<unknown> {
-  const url = new URL(path, BASE_URL);
-  const formData = new FormData();
-  const blob = new Blob([new Uint8Array(fileBuffer)], { type: mimeType });
-  formData.append("attachment", blob, fileName);
-  formData.append("payload[size]", String(fileBuffer.length));
-  formData.append("payload[type]", mimeType);
-  formData.append("payload[name]", fileName);
-
-  const headers: Record<string, string> = {
-    Authorization: `Bearer ${getApiKey()}`,
-    Accept: "application/json",
-  };
-
-  const response = await fetch(url.toString(), { method: "POST", headers, body: formData });
-  const text = await response.text();
-  if (!response.ok) {
-    throw new Error(`Grinfi API error ${response.status}: ${text}`);
-  }
-  try {
-    return JSON.parse(text);
-  } catch {
-    return { rawResponse: text };
-  }
-}
-
 function enrichLeadWithLinks(lead: Record<string, unknown>): Record<string, unknown> {
   if (lead.uuid) {
     lead._grinfi_contact_url = `https://leadgen.grinfi.io/crm/contacts/${lead.uuid}`;
@@ -187,31 +155,13 @@ function createMcpServer(): McpServer {
     instructions ? { instructions } : undefined
   );
 
-  // Wrap server.tool to catch unhandled errors in any handler
-  const originalTool = server.tool.bind(server);
-  server.tool = ((...args: unknown[]) => {
-    // Find the handler function (last argument)
-    const handlerIndex = args.length - 1;
-    const originalHandler = args[handlerIndex] as (...a: unknown[]) => Promise<unknown>;
-    args[handlerIndex] = async (...handlerArgs: unknown[]) => {
-      try {
-        return await originalHandler(...handlerArgs);
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        console.error(`Tool error: ${message}`);
-        return { content: [{ type: "text" as const, text: JSON.stringify({ error: message }) }] };
-      }
-    };
-    return (originalTool as (...a: unknown[]) => unknown)(...args);
-  }) as typeof server.tool;
-
   // ===========================
   // CONTACTS
   // ===========================
 
   server.tool(
     "find_contact",
-    "Find a single contact by LinkedIn ID or email. Requires linkedin_id or email — do NOT use this for searching by name. To search by name or company, use search_contacts with filter: {q: \"name\"}. Results include _grinfi_contact_url and _linkedin_url.",
+    "Find a single contact by LinkedIn ID, email, or name + company. You must provide at least one: linkedin_id, email, or both name and company_name. Results include _grinfi_contact_url (https://leadgen.grinfi.io/crm/contacts/{uuid}) and _linkedin_url. The Grinfi messenger is at https://leadgen.grinfi.io/messenger/",
     {
       linkedin_id: z.string().optional().describe("LinkedIn profile URL or ID"),
       email: z.string().optional().describe("Email address"),
@@ -233,18 +183,9 @@ function createMcpServer(): McpServer {
 
   server.tool(
     "search_contacts",
-    `Search contacts by name, company, or filter criteria. If you already have a UUID — use get_contact instead. If you have a LinkedIn URL or email — use find_contact instead.
-
-Filter supports: scalar values (equals), arrays (IN), objects with operators (>=, <=, >, <, =, !=, <>), 'is_null', 'is_not_null'.
-
-IMPORTANT: To search by name, company, or any text — use filter.q (e.g. filter: {q: "John Doe"}).
-Text fields like first_name, last_name, name, company_name do NOT work as direct filters.
-
-Supported filter fields: q (text search by name/company/email), list_uuid, pipeline_stage_uuid, email_status, linkedin_status, status, tags (array of tag UUIDs), sender_profile_uuid, data_source_uuid, created_at, updated_at (with operators >= <= etc).
-
-Results include _grinfi_contact_url and _linkedin_url for each contact.`,
+    "Search contacts with filters, sorting, and pagination. Filter supports: scalar values (equals), arrays (IN), objects with operators (>=, <=, >, <, =, !=, <>), 'is_null', 'is_not_null'. Results include _grinfi_contact_url (https://leadgen.grinfi.io/crm/contacts/{uuid}) and _linkedin_url for each contact.",
     {
-      filter: z.record(z.string(), z.unknown()).optional().describe("Filter object. Use 'q' key for text search by name/company (e.g. {q: 'John'}). Other keys: list_uuid, pipeline_stage_uuid, email_status, linkedin_status, status, tags, sender_profile_uuid, created_at, updated_at"),
+      filter: z.record(z.string(), z.unknown()).optional().describe("Filter object"),
       limit: z.number().optional().describe("Number of results to return (default 20)"),
       offset: z.number().optional().describe("Number of results to skip (default 0)"),
       order_field: z.string().optional().describe("Field to sort by (default: created_at)"),
@@ -264,14 +205,14 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
     }
   );
 
-  server.tool("get_contact", "Get a contact by UUID. ALWAYS use this when UUID is already known — never search again by name/email if you have the UUID.", { uuid: z.string().describe("UUID of the contact") }, async (params) => {
+  server.tool("get_contact", "Get a contact by their UUID.", { uuid: z.string().describe("UUID of the contact") }, async (params) => {
     const result = await grinfiRequest("GET", `/leads/api/leads/${params.uuid}`);
     return jsonResult(result, true);
   });
 
   server.tool(
     "update_contact",
-    "Update a contact's fields by UUID. WARNING: pipeline_stage_uuid is silently ignored here — MUST use change_contact_pipeline_stage instead. Use work_email for business email and personal_email for personal email (not 'email').",
+    "Update a contact's fields by UUID. To change pipeline stage, use change_contact_pipeline_stage tool instead.",
     {
       uuid: z.string().describe("UUID of the contact to update"),
       first_name: z.string().optional().describe("First name"),
@@ -280,8 +221,7 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
       ln_id: z.string().optional().describe("LinkedIn member ID"),
       sn_id: z.string().optional().describe("Sales Navigator ID"),
       linkedin: z.string().optional().describe("LinkedIn profile handle"),
-      work_email: z.string().optional().describe("Work/business email address"),
-      personal_email: z.string().optional().describe("Personal email address"),
+      email: z.string().optional().describe("Email address"),
       about: z.string().optional().describe("Description / about text"),
       domain: z.string().optional().describe("Company domain for email finding"),
       headline: z.string().optional().describe("LinkedIn headline"),
@@ -330,7 +270,7 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
 
   server.tool(
     "change_contact_pipeline_stage",
-    "Change the pipeline stage of one or more contacts. Use list_pipeline_stages to get valid stage UUIDs. Also available as leads_mass_action with type 'contact_change_pipeline_stage'.",
+    "Change the pipeline stage of one or more contacts. Use list_pipeline_stages to get available stage UUIDs first.",
     {
       contact_uuids: z.array(z.string()).describe("Array of contact UUIDs to change"),
       pipeline_stage_uuid: z.string().describe("UUID of the target pipeline stage"),
@@ -347,7 +287,7 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
 
   server.tool(
     "leads_mass_action",
-    "Perform a mass action on leads. Actions ONLY available here (no separate tool): contact_assign_tag (payload: {tag_uuid}), contact_remove_tag (payload: {tag_uuid}), contact_move_to_list (payload: {list_uuid}). Actions that also have separate tools: contact_mark_read (no payload) - also see mark_conversation_as_read, contact_change_pipeline_stage (payload: {pipeline_stage_uuid}) - also see change_contact_pipeline_stage, contact_delete (no payload) - also see delete_contact. Filter: {ids: ['uuid1','uuid2']} for specific contacts or {all: true} for all matching.",
+    "Perform a mass action on leads. Types: contact_change_pipeline_stage, contact_mark_read, etc. For pipeline stage changes prefer change_contact_pipeline_stage tool.",
     {
       type: z.string().describe("Mass action type (e.g. 'contact_change_pipeline_stage', 'contact_mark_read')"),
       filter: z.record(z.string(), z.unknown()).describe("Filter to select leads"),
@@ -496,7 +436,7 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
 
   server.tool(
     "companies_mass_action",
-    "Perform a mass action on companies. Types: assign_tag (payload: {tag_uuid}), remove_tag (payload: {tag_uuid}), move_to_list (payload: {list_uuid}), change_pipeline_stage (payload: {pipeline_stage_uuid}), delete (no payload). Filter: {ids: ['uuid1','uuid2']} for specific companies or {all: true} for all matching.",
+    "Perform a mass action on companies. Types: assign_tag, remove_tag, move_to_list, change_pipeline_stage, delete, etc.",
     {
       type: z.string().describe("Mass action type"),
       filter: z.record(z.string(), z.unknown()).describe("Filter to select companies"),
@@ -828,16 +768,6 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
     return jsonResult(result);
   });
 
-  server.tool("upload_attachment", "Upload a file attachment. Provide the file as a base64-encoded string. Returns the attachment UUID and name to use with send_linkedin_message or send_email. Max 20MB. Allowed types: png, gif, jpg, jpeg, pdf, doc(x), xls(x), ppt(x), mp4, mov.", {
-    file_base64: z.string().describe("Base64-encoded file content"),
-    file_name: z.string().describe("File name with extension (e.g. 'proposal.pdf')"),
-    mime_type: z.string().describe("MIME type (e.g. 'application/pdf', 'image/png')"),
-  }, async (params) => {
-    const fileBuffer = Buffer.from(params.file_base64, "base64");
-    const result = await grinfiUpload("/flows/api/attachments", fileBuffer, params.file_name, params.mime_type);
-    return jsonResult(result);
-  });
-
   // ===========================
   // ENRICHMENT
   // ===========================
@@ -977,12 +907,12 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
     return jsonResult(result);
   });
 
-  server.tool("cancel_contact_from_all_automations", "Remove contact from ALL active automations permanently. Use after: sending manual reply, rejection, not-ICP classification. MUST call before sending manual messages to prevent conflicting automation messages.", { lead_uuid: z.string() }, async (params) => {
+  server.tool("cancel_contact_from_all_automations", "Cancel a contact from ALL active automations.", { lead_uuid: z.string() }, async (params) => {
     const result = await grinfiRequest("PUT", `/flows/api/flows/leads/${params.lead_uuid}/cancel-all`);
     return jsonResult(result);
   });
 
-  server.tool("continue_automation", "Resume a paused automation for a contact. Use only for neutral/early replies (e.g. 'ok', 'thanks' at 1-3 messages). Do NOT use if lead replied with interest, rejection, or after manual reply was sent.", { lead_uuid: z.string() }, async (params) => {
+  server.tool("continue_automation", "Continue (resume) an automation for a specific contact.", { lead_uuid: z.string() }, async (params) => {
     const result = await grinfiRequest("PUT", "/flows/api/tasks/continue-automation", { lead_uuid: params.lead_uuid });
     return jsonResult(result);
   });
@@ -993,7 +923,7 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
 
   server.tool(
     "create_task",
-    "SCHEDULE an action for the future — does NOT execute immediately. To send a LinkedIn message right now, use send_linkedin_message instead. Creates a manual task that will be executed at schedule_at time. Known task types: linkedin_send_message (default), linkedin_send_connection_request, linkedin_send_inmail, linkedin_like_latest_post, linkedin_endorse_skills.",
+    "Create a new task (e.g. send LinkedIn message) for a contact. The task is scheduled and will be executed by the automation system. Requires lead_uuid, sender_profile_uuid, message text, and schedule time.",
     {
       lead_uuid: z.string().describe("UUID of the contact (lead)"),
       sender_profile_uuid: z.string().describe("UUID of the sender profile to execute the task"),
@@ -1064,61 +994,29 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
   server.tool("mass_cancel_tasks", "Cancel multiple MANUAL tasks at once. Do NOT use for automatic (automation-created) tasks.", {
     uuids: z.array(z.string()).describe("Array of manual task UUIDs to cancel"),
   }, async (params) => {
-    const results: Array<{ uuid: string; status: string }> = [];
-    for (const uuid of params.uuids) {
-      try {
-        await grinfiRequest("PUT", `/flows/api/tasks/${uuid}/cancel`);
-        results.push({ uuid, status: "cancelled" });
-      } catch (err) {
-        results.push({ uuid, status: `error: ${err instanceof Error ? err.message : String(err)}` });
-      }
-    }
-    return jsonResult({ results, total: params.uuids.length, success: results.filter((r) => r.status === "cancelled").length });
+    const result = await grinfiRequest("PUT", "/flows/api/tasks/mass-cancel", { uuids: params.uuids });
+    return jsonResult(result);
   });
 
   server.tool("mass_complete_tasks", "Mark multiple MANUAL tasks as completed at once. Do NOT use for automatic (automation-created) tasks.", {
     uuids: z.array(z.string()).describe("Array of manual task UUIDs to complete"),
   }, async (params) => {
-    const results: Array<{ uuid: string; status: string }> = [];
-    for (const uuid of params.uuids) {
-      try {
-        await grinfiRequest("PUT", `/flows/api/tasks/${uuid}/complete`);
-        results.push({ uuid, status: "completed" });
-      } catch (err) {
-        results.push({ uuid, status: `error: ${err instanceof Error ? err.message : String(err)}` });
-      }
-    }
-    return jsonResult({ results, total: params.uuids.length, success: results.filter((r) => r.status === "completed").length });
+    const result = await grinfiRequest("PUT", "/flows/api/tasks/mass-complete", { uuids: params.uuids });
+    return jsonResult(result);
   });
 
   server.tool("mass_retry_tasks", "Retry multiple failed MANUAL tasks at once. Do NOT use for automatic (automation-created) tasks.", {
     uuids: z.array(z.string()).describe("Array of manual task UUIDs to retry"),
   }, async (params) => {
-    const results: Array<{ uuid: string; status: string }> = [];
-    for (const uuid of params.uuids) {
-      try {
-        await grinfiRequest("PUT", `/flows/api/tasks/${uuid}/retry`);
-        results.push({ uuid, status: "retried" });
-      } catch (err) {
-        results.push({ uuid, status: `error: ${err instanceof Error ? err.message : String(err)}` });
-      }
-    }
-    return jsonResult({ results, total: params.uuids.length, success: results.filter((r) => r.status === "retried").length });
+    const result = await grinfiRequest("PUT", "/flows/api/tasks/mass-retry", { uuids: params.uuids });
+    return jsonResult(result);
   });
 
   server.tool("mass_skip_tasks", "Skip multiple MANUAL tasks at once. Do NOT use for automatic (automation-created) tasks.", {
     uuids: z.array(z.string()).describe("Array of manual task UUIDs to skip"),
   }, async (params) => {
-    const results: Array<{ uuid: string; status: string }> = [];
-    for (const uuid of params.uuids) {
-      try {
-        await grinfiRequest("PUT", `/flows/api/tasks/${uuid}/skip`);
-        results.push({ uuid, status: "skipped" });
-      } catch (err) {
-        results.push({ uuid, status: `error: ${err instanceof Error ? err.message : String(err)}` });
-      }
-    }
-    return jsonResult({ results, total: params.uuids.length, success: results.filter((r) => r.status === "skipped").length });
+    const result = await grinfiRequest("PUT", "/flows/api/tasks/mass-skip", { uuids: params.uuids });
+    return jsonResult(result);
   });
 
   server.tool(
@@ -1150,11 +1048,11 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
 
   server.tool(
     "list_linkedin_messages",
-    "List LinkedIn messages from the unified inbox. Returns messages from ALL sender profiles by default — no need to call per sender profile. Set type to 'inbox' for received, 'outbox' for sent. Use order_field='sent_at', order_type='asc' for chronological conversation. For UNREAD conversations, use 'get_unread_conversations' instead.",
+    "List LinkedIn messages from the unified inbox. Supports filters, pagination, and sorting. Set type to 'inbox' for received messages, 'outbox' for sent. For UNREAD conversations, use the 'get_unread_conversations' tool instead.",
     {
       limit: z.number().optional(), offset: z.number().optional(),
       order_field: z.string().optional(), order_type: z.enum(["asc", "desc"]).optional(),
-      lead_uuid: z.string().optional(),
+      search: z.string().optional(), lead_uuid: z.string().optional(),
       sender_profile_uuid: z.string().optional(), linkedin_account_uuid: z.string().optional(),
       linkedin_conversation_uuid: z.string().optional(),
       status: z.string().optional(), type: z.string().optional(), user_id: z.string().optional(),
@@ -1184,7 +1082,7 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
         if (params.sender_profile_uuid) query["filter[sender_profile_uuid]"] = params.sender_profile_uuid;
 
         const messagesResult = await grinfiRequest("GET", "/flows/api/linkedin-messages", undefined, query) as {
-          data?: Array<{ lead_uuid: string; text: string; created_at: string; sender_profile_uuid: string; linkedin_conversation_uuid: string; [key: string]: unknown }>;
+          data?: Array<{ lead_uuid: string; text: string; created_at: string; sender_profile_uuid: string; [key: string]: unknown }>;
           total?: number;
         };
 
@@ -1198,50 +1096,56 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
           if (!leadLatestMessage.has(msg.lead_uuid)) leadLatestMessage.set(msg.lead_uuid, msg);
         }
 
-        // Fetch contacts in parallel batches for speed
-        const unreadConversations: Array<{
-          contact_name: string; contact_uuid: string; unread_counts: unknown;
+        const allUnread: Array<{
+          contact_name: string; contact_uuid: string; unread_count: number;
           latest_message: string; latest_message_at: string;
-          sender_profile_uuid: string; conversation_uuid: string;
+          sender_profile_uuid: string; _grinfi_contact_url: string;
         }> = [];
 
         const entries = Array.from(leadLatestMessage.entries());
-        const BATCH_SIZE = 50;
-        for (let i = 0; i < entries.length; i += BATCH_SIZE) {
-          const batch = entries.slice(i, i + BATCH_SIZE);
-          const results = await Promise.allSettled(
-            batch.map(async ([leadUuid, latestMsg]) => {
-              const leadData = await grinfiRequest("GET", `/leads/api/leads/${leadUuid}`) as {
-                lead?: { name?: string; unread_counts?: Array<{ count: number; channel: string; sender_profile_uuid: string }> };
+        const results = await Promise.allSettled(
+          entries.map(async ([leadUuid, latestMsg]) => {
+            const leadData = await grinfiRequest("GET", `/leads/api/leads/${leadUuid}`) as {
+              lead?: { name?: string; unread_counts?: Array<{ count: number }> };
+            };
+            const counts = leadData.lead?.unread_counts ?? [];
+            const total = counts.reduce((s, u) => s + u.count, 0);
+            if (total > 0) {
+              return {
+                contact_name: leadData.lead?.name ?? "Unknown",
+                contact_uuid: leadUuid,
+                unread_count: total,
+                latest_message: latestMsg.text || "",
+                latest_message_at: latestMsg.created_at,
+                sender_profile_uuid: latestMsg.sender_profile_uuid,
+                _grinfi_contact_url: `https://leadgen.grinfi.io/crm/contacts/${leadUuid}`,
               };
-              const unreadCounts = leadData.lead?.unread_counts ?? [];
-              if (unreadCounts.length > 0 && unreadCounts.some((uc) => uc.count > 0)) {
-                return {
-                  contact_name: leadData.lead?.name ?? "Unknown",
-                  contact_uuid: leadUuid,
-                  unread_counts: unreadCounts,
-                  latest_message: latestMsg.text,
-                  latest_message_at: latestMsg.created_at,
-                  sender_profile_uuid: latestMsg.sender_profile_uuid,
-                  conversation_uuid: latestMsg.linkedin_conversation_uuid,
-                };
-              }
-              return null;
-            })
-          );
-          for (const r of results) {
-            if (r.status === "fulfilled" && r.value) {
-              unreadConversations.push(r.value);
             }
+            return null;
+          })
+        );
+
+        for (const r of results) {
+          if (r.status === "fulfilled" && r.value) {
+            allUnread.push(r.value);
           }
         }
 
+        // Return first 20 with full messages, rest as compact list
+        const detailed = allUnread.slice(0, 20);
+        const remaining = allUnread.slice(20).map(c => ({
+          contact_name: c.contact_name,
+          contact_uuid: c.contact_uuid,
+          unread_count: c.unread_count,
+          _grinfi_contact_url: c._grinfi_contact_url,
+        }));
+
         return jsonResult({
-          unread_conversations: unreadConversations,
-          total_unread: unreadConversations.length,
+          unread_conversations: detailed,
+          more_unread: remaining.length > 0 ? remaining : undefined,
+          total_unread: allUnread.length,
           scanned_messages: messagesResult.data.length,
           total_inbox_messages: messagesResult.total,
-          note: "Showing contacts with unread_counts > 0 from recent inbox messages",
         });
       } catch (err) {
         return jsonResult({ error: `Failed to fetch unread conversations: ${err instanceof Error ? err.message : String(err)}` });
@@ -1259,24 +1163,14 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
     return jsonResult(result);
   });
 
-  server.tool("send_linkedin_message", "Send a LinkedIn message to a contact IMMEDIATELY (right now). IMPORTANT: Always draft the message and get user confirmation before sending. To schedule for later, use create_task. Set linkedin_messenger_type to 'sn' for InMail (requires subject), 'basic' (default) for regular message. To attach files, first upload with upload_attachment, then pass UUIDs in attachments array.", {
+  server.tool("send_linkedin_message", "Send a LinkedIn message to a contact.", {
     sender_profile_uuid: z.string(), lead_uuid: z.string(), text: z.string(),
     template_uuid: z.string().optional(),
-    linkedin_messenger_type: z.enum(["basic", "sn"]).optional().default("basic").describe("'basic' for regular LinkedIn message, 'sn' for InMail"),
-    subject: z.string().optional().describe("Subject line (required for InMail, ignored for basic messages)"),
-    attachments: z.array(z.object({ uuid: z.string(), name: z.string() })).optional().describe("Array of attachment objects {uuid, name} from upload_attachment"),
   }, async (params) => {
     const body: Record<string, unknown> = {
       sender_profile_uuid: params.sender_profile_uuid, lead_uuid: params.lead_uuid, text: params.text,
-      linkedin_messenger_type: params.linkedin_messenger_type || "basic",
     };
     if (params.template_uuid) body.template_uuid = params.template_uuid;
-    if (params.subject) body.subject = params.subject;
-    if (params.attachments && params.attachments.length > 0) {
-      body.attachments = params.attachments;
-    } else {
-      body.attachments = [];
-    }
     const result = await grinfiRequest("POST", "/flows/api/linkedin-messages", body);
     return jsonResult(result);
   });
@@ -1311,38 +1205,26 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
     return jsonResult(result);
   });
 
-  server.tool("get_email", "Get email metadata by UUID: from/to addresses, subject, status, timestamps. Does NOT include the email HTML body — use get_email_body with the email_body_uuid from this response to get content.", {
+  server.tool("get_email", "Get a specific email by UUID. Returns full email details including from/to, subject, status, timestamps.", {
     uuid: z.string().describe("UUID of the email"),
   }, async (params) => {
     const result = await grinfiRequest("GET", `/emails/api/emails/${params.uuid}`);
     return jsonResult(result);
   });
 
-  server.tool("send_email", "Send an email to a contact. Requires mailbox_uuid (use list_mailboxes to find it) and body (HTML content). The to field is an array of recipients [{to_email, to_name}].", {
-    sender_profile_uuid: z.string().describe("UUID of the sender profile"),
-    lead_uuid: z.string().describe("UUID of the contact (lead)"),
-    mailbox_uuid: z.string().describe("UUID of the sending mailbox (use list_mailboxes to find)"),
-    from_name: z.string().describe("Sender display name"),
-    from_email: z.string().describe("Sender email address"),
-    to: z.array(z.object({
-      to_email: z.string().describe("Recipient email address"),
-      to_name: z.string().optional().describe("Recipient name"),
-    })).describe("Array of recipients [{to_email, to_name}]"),
-    subject: z.string().describe("Email subject line"),
-    body: z.string().describe("Email body in HTML format (e.g. '<p>Hello!</p>')"),
-    cc: z.array(z.string()).optional().describe("CC email addresses"),
-    bcc: z.array(z.string()).optional().describe("BCC email addresses"),
-    attachments: z.array(z.object({ uuid: z.string(), name: z.string() })).optional().describe("Array of attachment objects {uuid, name} from upload_attachment"),
+  server.tool("send_email", "Send an email to a contact.", {
+    sender_profile_uuid: z.string(), lead_uuid: z.string(),
+    from_name: z.string(), from_email: z.string(),
+    to_name: z.string(), to_email: z.string(), subject: z.string(),
+    cc: z.array(z.string()).optional(), bcc: z.array(z.string()).optional(),
   }, async (params) => {
     const body: Record<string, unknown> = {
       sender_profile_uuid: params.sender_profile_uuid, lead_uuid: params.lead_uuid,
-      mailbox_uuid: params.mailbox_uuid,
       from_name: params.from_name, from_email: params.from_email,
-      to: params.to, subject: params.subject, body: params.body,
+      to_name: params.to_name, to_email: params.to_email, subject: params.subject,
     };
     if (params.cc) body.cc = params.cc;
     if (params.bcc) body.bcc = params.bcc;
-    if (params.attachments && params.attachments.length > 0) body.attachments = params.attachments;
     const result = await grinfiRequest("POST", "/emails/api/emails/send-email", body);
     return jsonResult(result);
   });
@@ -1352,7 +1234,7 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
     return jsonResult(result);
   });
 
-  server.tool("get_email_body", "Get email HTML content and attachments by email_body_uuid. First call get_email to get the email_body_uuid, then use this tool to read the actual email content.", {
+  server.tool("get_email_body", "Get an email body (HTML content, subject, attachments) by UUID.", {
     uuid: z.string().describe("UUID of the email body"),
   }, async (params) => {
     const result = await grinfiRequest("GET", `/emails/api/email-bodies/${params.uuid}`);
@@ -1368,7 +1250,7 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
     return jsonResult(result);
   });
 
-  server.tool("get_email_thread", "Render the email conversation thread for a reply email. Returns formatted HTML thread. Use when you need the raw thread for a specific reply.", {
+  server.tool("get_email_thread", "Render the email conversation thread for a reply email.", {
     reply_to_email_uuid: z.string().describe("UUID of the reply email to render thread for"),
   }, async (params) => {
     const result = await grinfiRequest("GET", `/emails/api/emails/${params.reply_to_email_uuid}/thread`);
@@ -1377,7 +1259,7 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
 
   server.tool(
     "get_email_llm_thread",
-    "Get an email conversation thread optimized for AI analysis. Returns clean text format — use this when you need to understand the email conversation history before composing a reply.",
+    "Get an email conversation thread formatted for LLM processing. Optimized for AI analysis and response generation.",
     {
       sender_profile_uuid: z.string().describe("UUID of the sender profile"),
       lead_uuid: z.string().describe("UUID of the contact"),
@@ -1481,6 +1363,7 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
   server.tool("list_mailbox_errors", "List mailbox errors for debugging. Shows send/sync errors with timestamps and details.", {
     limit: z.number().optional(), offset: z.number().optional(),
     order_field: z.string().optional(), order_type: z.enum(["asc", "desc"]).optional(),
+    search: z.string().optional(),
   }, async (params) => {
     const result = await grinfiRequest("GET", "/emails/api/mailbox-errors", undefined, buildQuery(params));
     return jsonResult(result);
@@ -1745,14 +1628,6 @@ async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }
-
-// Prevent process crashes from killing MCP connection
-process.on("uncaughtException", (err) => {
-  console.error("Uncaught exception (kept alive):", err.message);
-});
-process.on("unhandledRejection", (reason) => {
-  console.error("Unhandled rejection (kept alive):", reason);
-});
 
 main().catch((error) => {
   console.error("Failed to start Grinfi MCP server:", error);
