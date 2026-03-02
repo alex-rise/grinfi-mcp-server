@@ -1176,7 +1176,7 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
     async (params) => {
       try {
         const query: Record<string, string> = {
-          limit: String(Math.min(params.limit ?? 300, 1000)),
+          limit: String(Math.min(params.limit ?? 70, 1000)),
           "filter[type]": "inbox",
           order_field: "created_at",
           order_type: "desc",
