@@ -1256,32 +1256,43 @@ Results include _grinfi_contact_url and _linkedin_url for each contact.`,
           return jsonResult({ unread_conversations: [], total_unread: 0, note: "No inbox messages found" });
         }
 
-        // Fetch each contact and check unread_counts
+        // Fetch contacts in parallel batches to avoid timeout
         const unreadConversations: Array<{
           contact_name: string; contact_uuid: string; unread_counts: unknown;
           latest_message: string; latest_message_at: string;
           channel: string; sender_profile_uuid: string; conversation_id: string;
         }> = [];
 
-        for (const [leadUuid, latest] of leadLatest) {
-          try {
-            const leadData = await grinfiRequest("GET", `/leads/api/leads/${leadUuid}`) as {
-              lead?: { name?: string; unread_counts?: Array<{ count: number; channel: string; sender_profile_uuid: string }> };
-            };
-            const unreadCounts = leadData.lead?.unread_counts ?? [];
-            if (unreadCounts.length > 0 && unreadCounts.some((uc) => uc.count > 0)) {
-              unreadConversations.push({
-                contact_name: leadData.lead?.name ?? "Unknown",
-                contact_uuid: leadUuid,
-                unread_counts: unreadCounts,
-                latest_message: latest.text,
-                latest_message_at: latest.created_at,
-                channel: latest.channel,
-                sender_profile_uuid: latest.sender_profile_uuid,
-                conversation_id: latest.conversation_id,
-              });
+        const entries = Array.from(leadLatest.entries());
+        const BATCH_SIZE = 20;
+        for (let i = 0; i < entries.length; i += BATCH_SIZE) {
+          const batch = entries.slice(i, i + BATCH_SIZE);
+          const results = await Promise.allSettled(
+            batch.map(async ([leadUuid, latest]) => {
+              const leadData = await grinfiRequest("GET", `/leads/api/leads/${leadUuid}`) as {
+                lead?: { name?: string; unread_counts?: Array<{ count: number; channel: string; sender_profile_uuid: string }> };
+              };
+              const unreadCounts = leadData.lead?.unread_counts ?? [];
+              if (unreadCounts.length > 0 && unreadCounts.some((uc) => uc.count > 0)) {
+                return {
+                  contact_name: leadData.lead?.name ?? "Unknown",
+                  contact_uuid: leadUuid,
+                  unread_counts: unreadCounts,
+                  latest_message: latest.text,
+                  latest_message_at: latest.created_at,
+                  channel: latest.channel,
+                  sender_profile_uuid: latest.sender_profile_uuid,
+                  conversation_id: latest.conversation_id,
+                };
+              }
+              return null;
+            })
+          );
+          for (const r of results) {
+            if (r.status === "fulfilled" && r.value) {
+              unreadConversations.push(r.value);
             }
-          } catch { /* skip individual lead fetch errors */ }
+          }
         }
 
         return jsonResult({
