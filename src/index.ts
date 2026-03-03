@@ -1073,8 +1073,9 @@ function createMcpServer(): McpServer {
     },
     async (params) => {
       try {
+        const requestedLimit = Math.min(params.limit ?? 300, 1000);
         const query: Record<string, string> = {
-          limit: String(Math.min(params.limit ?? 300, 1000)),
+          limit: String(requestedLimit),
           "filter[type]": "inbox",
           order_field: "created_at",
           order_type: "desc",
@@ -1096,20 +1097,23 @@ function createMcpServer(): McpServer {
           if (!leadLatestMessage.has(msg.lead_uuid)) leadLatestMessage.set(msg.lead_uuid, msg);
         }
 
+        const MAX_LEADS = 20;
+        const entries = Array.from(leadLatestMessage.entries()).slice(0, MAX_LEADS);
+        const totalUniqueLeads = leadLatestMessage.size;
+
         const allUnread: Array<{
           contact_name: string; contact_uuid: string; unread_count: number;
           latest_message: string; latest_message_at: string;
           sender_profile_uuid: string; _grinfi_contact_url: string;
         }> = [];
 
-        const entries = Array.from(leadLatestMessage.entries());
         const results = await Promise.allSettled(
           entries.map(async ([leadUuid, latestMsg]) => {
             const leadData = await grinfiRequest("GET", `/leads/api/leads/${leadUuid}`) as {
               lead?: { name?: string; unread_counts?: Array<{ count: number }> };
             };
             const counts = leadData.lead?.unread_counts ?? [];
-            const total = counts.reduce((s, u) => s + u.count, 0);
+            const total = counts.reduce((s: number, u: { count: number }) => s + u.count, 0);
             if (total > 0) {
               return {
                 contact_name: leadData.lead?.name ?? "Unknown",
@@ -1131,21 +1135,16 @@ function createMcpServer(): McpServer {
           }
         }
 
-        // Return first 20 with full messages, rest as compact list
-        const detailed = allUnread.slice(0, 20);
-        const remaining = allUnread.slice(20).map(c => ({
-          contact_name: c.contact_name,
-          contact_uuid: c.contact_uuid,
-          unread_count: c.unread_count,
-          _grinfi_contact_url: c._grinfi_contact_url,
-        }));
-
         return jsonResult({
-          unread_conversations: detailed,
-          more_unread: remaining.length > 0 ? remaining : undefined,
+          unread_conversations: allUnread,
           total_unread: allUnread.length,
           scanned_messages: messagesResult.data.length,
           total_inbox_messages: messagesResult.total,
+          unique_leads_in_inbox: totalUniqueLeads,
+          leads_checked: entries.length,
+          note: totalUniqueLeads > MAX_LEADS
+            ? `Checked ${MAX_LEADS} most recent leads out of ${totalUniqueLeads}. Increase 'limit' param to scan more messages.`
+            : undefined,
         });
       } catch (err) {
         return jsonResult({ error: `Failed to fetch unread conversations: ${err instanceof Error ? err.message : String(err)}` });
