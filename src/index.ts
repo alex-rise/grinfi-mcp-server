@@ -1066,85 +1066,66 @@ function createMcpServer(): McpServer {
 
   server.tool(
     "get_unread_conversations",
-    "Get contacts that have unread LinkedIn or email messages. This fetches recent inbox messages, then checks each contact's unread_counts field. Returns a list of contacts with unread messages and the latest message from each. Use this when the user asks about unread or new messages.",
+    "Get contacts that have unread LinkedIn or email messages. This fetches recent leads sorted by updated_at and filters those with unread_counts > 0. Returns a list of contacts with unread messages. Use list_linkedin_messages with lead_uuid filter to read specific conversations.",
     {
       limit: z.number().optional().describe("How many recent inbox messages to scan (default 300, max 1000)"),
       sender_profile_uuid: z.string().optional().describe("Filter by sender profile UUID"),
     },
     async (params) => {
       try {
-        const requestedLimit = Math.min(params.limit ?? 300, 1000);
-        const query: Record<string, string> = {
-          limit: String(requestedLimit),
-          "filter[type]": "inbox",
-          order_field: "created_at",
+        const baseQuery: Record<string, string> = {
+          order_field: "updated_at",
           order_type: "desc",
         };
-        if (params.sender_profile_uuid) query["filter[sender_profile_uuid]"] = params.sender_profile_uuid;
+        if (params.sender_profile_uuid) baseQuery["filter[sender_profile_uuid]"] = params.sender_profile_uuid;
 
-        const messagesResult = await grinfiRequest("GET", "/flows/api/linkedin-messages", undefined, query) as {
-          data?: Array<{ lead_uuid: string; text: string; created_at: string; sender_profile_uuid: string; [key: string]: unknown }>;
-          total?: number;
-        };
+        // Fetch three pages of 200 leads in parallel (sorted by updated_at desc)
+        const [page1, page2, page3] = await Promise.all([
+          grinfiRequest("GET", "/leads/api/leads", undefined, { ...baseQuery, limit: "200", offset: "0" }) as Promise<{
+            data?: Array<{ uuid: string; name?: string; first_name?: string; last_name?: string; unread_counts?: Array<{ count: number }>; [key: string]: unknown }>;
+            total?: number;
+          }>,
+          grinfiRequest("GET", "/leads/api/leads", undefined, { ...baseQuery, limit: "200", offset: "200" }) as Promise<{
+            data?: Array<{ uuid: string; name?: string; first_name?: string; last_name?: string; unread_counts?: Array<{ count: number }>; [key: string]: unknown }>;
+            total?: number;
+          }>,
+          grinfiRequest("GET", "/leads/api/leads", undefined, { ...baseQuery, limit: "200", offset: "400" }) as Promise<{
+            data?: Array<{ uuid: string; name?: string; first_name?: string; last_name?: string; unread_counts?: Array<{ count: number }>; [key: string]: unknown }>;
+            total?: number;
+          }>,
+        ]);
 
-        if (!messagesResult.data || messagesResult.data.length === 0) {
-          return jsonResult({ unread_conversations: [], total_unread: 0, note: "No inbox messages found" });
-        }
+        // Merge and deduplicate by UUID
+        const allLeads = [...(page1.data ?? []), ...(page2.data ?? []), ...(page3.data ?? [])];
+        const seen = new Set<string>();
+        const uniqueLeads = allLeads.filter((lead) => {
+          if (!lead.uuid || seen.has(lead.uuid)) return false;
+          seen.add(lead.uuid);
+          return true;
+        });
 
-        const leadLatestMessage = new Map<string, (typeof messagesResult.data)[0]>();
-        for (const msg of messagesResult.data) {
-          if (!msg.lead_uuid) continue;
-          if (!leadLatestMessage.has(msg.lead_uuid)) leadLatestMessage.set(msg.lead_uuid, msg);
-        }
-
-        const MAX_LEADS = 50;
-        const entries = Array.from(leadLatestMessage.entries()).slice(0, MAX_LEADS);
-        const totalUniqueLeads = leadLatestMessage.size;
-
-        const allUnread: Array<{
-          contact_name: string; contact_uuid: string; unread_count: number;
-          latest_message: string; latest_message_at: string;
-          sender_profile_uuid: string; _grinfi_contact_url: string;
-        }> = [];
-
-        const results = await Promise.allSettled(
-          entries.map(async ([leadUuid, latestMsg]) => {
-            const leadData = await grinfiRequest("GET", `/leads/api/leads/${leadUuid}`) as {
-              lead?: { name?: string; unread_counts?: Array<{ count: number }> };
-            };
-            const counts = leadData.lead?.unread_counts ?? [];
+        // Filter leads with unread_counts sum > 0
+        const unreadLeads = uniqueLeads
+          .map((lead) => {
+            const counts = lead.unread_counts ?? [];
             const total = counts.reduce((s: number, u: { count: number }) => s + u.count, 0);
-            if (total > 0) {
-              return {
-                contact_name: leadData.lead?.name ?? "Unknown",
-                contact_uuid: leadUuid,
-                unread_count: total,
-                latest_message: latestMsg.text || "",
-                latest_message_at: latestMsg.created_at,
-                sender_profile_uuid: latestMsg.sender_profile_uuid,
-                _grinfi_contact_url: `https://leadgen.grinfi.io/crm/contacts/${leadUuid}`,
-              };
-            }
-            return null;
+            if (total <= 0) return null;
+            const contactName = lead.name || [lead.first_name, lead.last_name].filter(Boolean).join(" ") || "Unknown";
+            return {
+              contact_name: contactName,
+              contact_uuid: lead.uuid,
+              unread_count: total,
+              _grinfi_contact_url: `https://leadgen.grinfi.io/crm/contacts/${lead.uuid}`,
+            };
           })
-        );
-
-        for (const r of results) {
-          if (r.status === "fulfilled" && r.value) {
-            allUnread.push(r.value);
-          }
-        }
+          .filter((x): x is NonNullable<typeof x> => x !== null);
 
         return jsonResult({
-          unread_conversations: allUnread,
-          total_unread: allUnread.length,
-          scanned_messages: messagesResult.data.length,
-          total_inbox_messages: messagesResult.total,
-          unique_leads_in_inbox: totalUniqueLeads,
-          leads_checked: entries.length,
-          note: totalUniqueLeads > MAX_LEADS
-            ? `Checked ${MAX_LEADS} most recent leads out of ${totalUniqueLeads}. Increase 'limit' param to scan more messages.`
-            : undefined,
+          unread_conversations: unreadLeads,
+          total_unread: unreadLeads.length,
+          leads_scanned: uniqueLeads.length,
+          total_leads_in_crm: page1.total,
+          note: "Use list_linkedin_messages with lead_uuid filter to read specific conversations.",
         });
       } catch (err) {
         return jsonResult({ error: `Failed to fetch unread conversations: ${err instanceof Error ? err.message : String(err)}` });
