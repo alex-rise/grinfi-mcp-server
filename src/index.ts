@@ -1097,7 +1097,7 @@ function createMcpServer(): McpServer {
           if (!leadLatestMessage.has(msg.lead_uuid)) leadLatestMessage.set(msg.lead_uuid, msg);
         }
 
-        const MAX_LEADS = 20;
+        const MAX_LEADS = 50;
         const entries = Array.from(leadLatestMessage.entries()).slice(0, MAX_LEADS);
         const totalUniqueLeads = leadLatestMessage.size;
 
