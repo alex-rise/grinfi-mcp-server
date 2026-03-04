@@ -1066,66 +1066,94 @@ function createMcpServer(): McpServer {
 
   server.tool(
     "get_unread_conversations",
-    "Get contacts that have unread LinkedIn or email messages. This fetches recent leads sorted by updated_at and filters those with unread_counts > 0. Returns a list of contacts with unread messages. Use list_linkedin_messages with lead_uuid filter to read specific conversations.",
+    "Get contacts that have unread LinkedIn or email messages. This fetches recent inbox messages, then checks each contact's unread_counts field. Returns a list of contacts with unread messages and the latest message from each. Use this when the user asks about unread or new messages.",
     {
       limit: z.number().optional().describe("How many recent inbox messages to scan (default 300, max 1000)"),
       sender_profile_uuid: z.string().optional().describe("Filter by sender profile UUID"),
     },
     async (params) => {
       try {
-        const baseQuery: Record<string, string> = {
-          order_field: "updated_at",
+        // Step 1: Fetch sender profiles to build Elasticsearch query
+        const spResult = await grinfiRequest("GET", "/flows/api/sender-profiles", undefined, {
+          limit: "100", offset: "0",
+        }) as { data?: Array<{ uuid: string; first_name?: string; last_name?: string }> };
+
+        const senderProfiles = spResult.data ?? [];
+        if (senderProfiles.length === 0) {
+          return jsonResult({ error: "No sender profiles found" });
+        }
+
+        // Build the should clause: for each sender profile, require unread_counts > 0
+        let profileUuids = senderProfiles.map((sp: { uuid: string }) => sp.uuid);
+
+        // If filtering by specific sender_profile_uuid, only use that one
+        if (params.sender_profile_uuid) {
+          profileUuids = profileUuids.filter((u: string) => u === params.sender_profile_uuid);
+          if (profileUuids.length === 0) {
+            return jsonResult({ unread_conversations: [], total_unread: 0, note: "Sender profile not found" });
+          }
+        }
+
+        const shouldClauses = profileUuids.map((uuid: string) => ({
+          bool: {
+            must: [
+              { term: { "unread_counts.sender_profile_uuid": uuid } },
+              { range: { "unread_counts.count": { gt: "0" } } },
+            ],
+          },
+        }));
+
+        // Step 2: POST to Elasticsearch-powered leads/list endpoint
+        const esBody = {
+          order_field: "markers.last_messaging_activity_at",
           order_type: "desc",
+          limit: params.limit ?? 50,
+          offset: 0,
+          nested_sort_filter: { "markers.sender_profile_uuid": null },
+          filter: {
+            elasticQuery: {
+              bool: {
+                must: [{ bool: { should: shouldClauses } }],
+              },
+            },
+            leadFilter: {},
+          },
         };
-        if (params.sender_profile_uuid) baseQuery["filter[sender_profile_uuid]"] = params.sender_profile_uuid;
 
-        // Fetch three pages of 200 leads in parallel (sorted by updated_at desc)
-        const [page1, page2, page3] = await Promise.all([
-          grinfiRequest("GET", "/leads/api/leads", undefined, { ...baseQuery, limit: "200", offset: "0" }) as Promise<{
-            data?: Array<{ uuid: string; name?: string; first_name?: string; last_name?: string; unread_counts?: Array<{ count: number }>; [key: string]: unknown }>;
-            total?: number;
-          }>,
-          grinfiRequest("GET", "/leads/api/leads", undefined, { ...baseQuery, limit: "200", offset: "200" }) as Promise<{
-            data?: Array<{ uuid: string; name?: string; first_name?: string; last_name?: string; unread_counts?: Array<{ count: number }>; [key: string]: unknown }>;
-            total?: number;
-          }>,
-          grinfiRequest("GET", "/leads/api/leads", undefined, { ...baseQuery, limit: "200", offset: "400" }) as Promise<{
-            data?: Array<{ uuid: string; name?: string; first_name?: string; last_name?: string; unread_counts?: Array<{ count: number }>; [key: string]: unknown }>;
-            total?: number;
-          }>,
-        ]);
+        const esResult = await grinfiRequest("POST", "/leads/c1/api/leads/list", esBody) as {
+          data?: Array<{
+            lead: {
+              uuid: string;
+              name?: string;
+              first_name?: string;
+              last_name?: string;
+              unread_counts?: Array<{ count: number; sender_profile_uuid: string }>;
+            };
+          }>;
+          total?: number;
+        };
 
-        // Merge and deduplicate by UUID
-        const allLeads = [...(page1.data ?? []), ...(page2.data ?? []), ...(page3.data ?? [])];
-        const seen = new Set<string>();
-        const uniqueLeads = allLeads.filter((lead) => {
-          if (!lead.uuid || seen.has(lead.uuid)) return false;
-          seen.add(lead.uuid);
-          return true;
+        const items = esResult.data ?? [];
+
+        // Step 3: Build result — unwrap .lead from each item
+        const allUnread = items.map((item: { lead: { uuid: string; name?: string; first_name?: string; last_name?: string; unread_counts?: Array<{ count: number }> } }) => {
+          const lead = item.lead;
+          const totalUnread = (lead.unread_counts ?? []).reduce((s: number, u: { count: number }) => s + u.count, 0);
+          const contactName = lead.name || [lead.first_name, lead.last_name].filter(Boolean).join(" ") || "Unknown";
+          return {
+            contact_name: contactName,
+            contact_uuid: lead.uuid,
+            unread_count: totalUnread,
+            _grinfi_contact_url: `https://leadgen.grinfi.io/crm/contacts/${lead.uuid}`,
+          };
         });
 
-        // Filter leads with unread_counts sum > 0
-        const unreadLeads = uniqueLeads
-          .map((lead) => {
-            const counts = lead.unread_counts ?? [];
-            const total = counts.reduce((s: number, u: { count: number }) => s + u.count, 0);
-            if (total <= 0) return null;
-            const contactName = lead.name || [lead.first_name, lead.last_name].filter(Boolean).join(" ") || "Unknown";
-            return {
-              contact_name: contactName,
-              contact_uuid: lead.uuid,
-              unread_count: total,
-              _grinfi_contact_url: `https://leadgen.grinfi.io/crm/contacts/${lead.uuid}`,
-            };
-          })
-          .filter((x): x is NonNullable<typeof x> => x !== null);
-
         return jsonResult({
-          unread_conversations: unreadLeads,
-          total_unread: unreadLeads.length,
-          leads_scanned: uniqueLeads.length,
-          total_leads_in_crm: page1.total,
-          note: "Use list_linkedin_messages with lead_uuid filter to read specific conversations.",
+          unread_conversations: allUnread,
+          total_unread: allUnread.length,
+          total_in_filter: esResult.total ?? allUnread.length,
+          sender_profiles_checked: profileUuids.length,
+          note: "Use list_linkedin_messages with lead_uuid filter to read specific conversations",
         });
       } catch (err) {
         return jsonResult({ error: `Failed to fetch unread conversations: ${err instanceof Error ? err.message : String(err)}` });
