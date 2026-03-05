@@ -923,7 +923,7 @@ function createMcpServer(): McpServer {
 
   server.tool(
     "create_task",
-    "Create a new task (e.g. send LinkedIn message) for a contact. The task is scheduled and will be executed by the automation system. Requires lead_uuid, sender_profile_uuid, message text, and schedule time.",
+    "SCHEDULE an action for the future — does NOT execute immediately. To send a LinkedIn message right now, use send_linkedin_message instead. Creates a manual task that will be executed at schedule_at time. Known task types: linkedin_send_message (default), linkedin_send_connection_request, linkedin_send_inmail, linkedin_like_latest_post, linkedin_endorse_skills.",
     {
       lead_uuid: z.string().describe("UUID of the contact (lead)"),
       sender_profile_uuid: z.string().describe("UUID of the sender profile to execute the task"),
