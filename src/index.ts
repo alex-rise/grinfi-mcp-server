@@ -956,12 +956,12 @@ function createMcpServer(): McpServer {
 
   server.tool(
     "list_tasks",
-    "List tasks with filters. Use automation='manual' for manual tasks. Statuses: in_progress, closed (done), canceled, failed. Use schedule_at_before to filter by due date.",
+    "List tasks with filters. Defaults to manual tasks only. Statuses: in_progress, closed (done), canceled, failed. Use schedule_at_before to filter by due date.",
     {
       limit: z.number().optional().describe("Number of results (default 20)"),
       offset: z.number().optional(), order_field: z.string().optional(),
       order_type: z.enum(["asc", "desc"]).optional(), search: z.string().optional(),
-      automation: z.enum(["manual", "auto"]).optional().describe("Filter: 'manual' for manual tasks, 'auto' for automation tasks"),
+      automation: z.enum(["manual", "auto"]).optional().describe("Filter: 'manual' (default) for manual tasks, 'auto' for automation tasks"),
       status: z.enum(["in_progress", "closed", "canceled", "failed"]).optional(),
       type: z.string().optional().describe("Filter by task type (e.g. 'linkedin_send_message')"),
       lead_uuid: z.string().optional(), sender_profile_uuid: z.string().optional(),
@@ -970,23 +970,37 @@ function createMcpServer(): McpServer {
       schedule_at_after: z.string().optional().describe("Filter tasks scheduled after this ISO date"),
     },
     async (params) => {
-      const query = buildQuery(params, ["automation", "status", "type", "lead_uuid", "sender_profile_uuid", "flow_uuid", "assignee_uuid", "schedule_at_before", "schedule_at_after"]);
+      // Default to manual tasks to prevent accidental operations on automation tasks
+      const safeParams = { ...params, automation: params.automation ?? "manual" };
+      const query = buildQuery(safeParams, ["automation", "status", "type", "lead_uuid", "sender_profile_uuid", "flow_uuid", "assignee_uuid", "schedule_at_before", "schedule_at_after"]);
       const result = await grinfiRequest("GET", "/flows/api/tasks", undefined, query);
       return jsonResult(result);
     }
   );
 
   server.tool("complete_task", "Mark a MANUAL task as completed. Do NOT use for automatic (automation-created) tasks.", { uuid: z.string().describe("UUID of the manual task to complete") }, async (params) => {
+    const task = await grinfiRequest("GET", `/flows/api/tasks/${params.uuid}`) as { automation?: string };
+    if (task.automation !== "manual") {
+      return jsonResult({ error: "BLOCKED: This is an automatic task (created by automation). Only MANUAL tasks can be completed via this tool." });
+    }
     const result = await grinfiRequest("PUT", `/flows/api/tasks/${params.uuid}/complete`);
     return jsonResult(result);
   });
 
   server.tool("cancel_task", "Cancel a MANUAL task. Do NOT use for automatic (automation-created) tasks.", { uuid: z.string().describe("UUID of the manual task to cancel") }, async (params) => {
+    const task = await grinfiRequest("GET", `/flows/api/tasks/${params.uuid}`) as { automation?: string };
+    if (task.automation !== "manual") {
+      return jsonResult({ error: "BLOCKED: This is an automatic task (created by automation). Only MANUAL tasks can be cancelled via this tool." });
+    }
     const result = await grinfiRequest("PUT", `/flows/api/tasks/${params.uuid}/cancel`);
     return jsonResult(result);
   });
 
   server.tool("fail_task", "Mark a MANUAL task as failed. Do NOT use for automatic (automation-created) tasks.", { uuid: z.string().describe("UUID of the manual task to fail") }, async (params) => {
+    const task = await grinfiRequest("GET", `/flows/api/tasks/${params.uuid}`) as { automation?: string };
+    if (task.automation !== "manual") {
+      return jsonResult({ error: "BLOCKED: This is an automatic task (created by automation). Only MANUAL tasks can be failed via this tool." });
+    }
     const result = await grinfiRequest("PUT", `/flows/api/tasks/${params.uuid}/fail`);
     return jsonResult(result);
   });
@@ -994,42 +1008,94 @@ function createMcpServer(): McpServer {
   server.tool("mass_cancel_tasks", "Cancel multiple MANUAL tasks at once. Do NOT use for automatic (automation-created) tasks.", {
     uuids: z.array(z.string()).describe("Array of manual task UUIDs to cancel"),
   }, async (params) => {
-    const result = await grinfiRequest("PUT", "/flows/api/tasks/mass-cancel", { uuids: params.uuids });
-    return jsonResult(result);
+    const results: Array<{ uuid: string; status: string }> = [];
+    for (const uuid of params.uuids) {
+      try {
+        const task = await grinfiRequest("GET", `/flows/api/tasks/${uuid}`) as { automation?: string };
+        if (task.automation !== "manual") {
+          results.push({ uuid, status: "BLOCKED: automatic task — skipped" });
+          continue;
+        }
+        await grinfiRequest("PUT", `/flows/api/tasks/${uuid}/cancel`);
+        results.push({ uuid, status: "cancelled" });
+      } catch (err) {
+        results.push({ uuid, status: `error: ${err instanceof Error ? err.message : String(err)}` });
+      }
+    }
+    return jsonResult({ results, total: params.uuids.length, success: results.filter((r) => r.status === "cancelled").length });
   });
 
   server.tool("mass_complete_tasks", "Mark multiple MANUAL tasks as completed at once. Do NOT use for automatic (automation-created) tasks.", {
     uuids: z.array(z.string()).describe("Array of manual task UUIDs to complete"),
   }, async (params) => {
-    const result = await grinfiRequest("PUT", "/flows/api/tasks/mass-complete", { uuids: params.uuids });
-    return jsonResult(result);
+    const results: Array<{ uuid: string; status: string }> = [];
+    for (const uuid of params.uuids) {
+      try {
+        const task = await grinfiRequest("GET", `/flows/api/tasks/${uuid}`) as { automation?: string };
+        if (task.automation !== "manual") {
+          results.push({ uuid, status: "BLOCKED: automatic task — skipped" });
+          continue;
+        }
+        await grinfiRequest("PUT", `/flows/api/tasks/${uuid}/complete`);
+        results.push({ uuid, status: "completed" });
+      } catch (err) {
+        results.push({ uuid, status: `error: ${err instanceof Error ? err.message : String(err)}` });
+      }
+    }
+    return jsonResult({ results, total: params.uuids.length, success: results.filter((r) => r.status === "completed").length });
   });
 
   server.tool("mass_retry_tasks", "Retry multiple failed MANUAL tasks at once. Do NOT use for automatic (automation-created) tasks.", {
     uuids: z.array(z.string()).describe("Array of manual task UUIDs to retry"),
   }, async (params) => {
-    const result = await grinfiRequest("PUT", "/flows/api/tasks/mass-retry", { uuids: params.uuids });
-    return jsonResult(result);
+    const results: Array<{ uuid: string; status: string }> = [];
+    for (const uuid of params.uuids) {
+      try {
+        const task = await grinfiRequest("GET", `/flows/api/tasks/${uuid}`) as { automation?: string };
+        if (task.automation !== "manual") {
+          results.push({ uuid, status: "BLOCKED: automatic task — skipped" });
+          continue;
+        }
+        await grinfiRequest("PUT", `/flows/api/tasks/${uuid}/retry`);
+        results.push({ uuid, status: "retried" });
+      } catch (err) {
+        results.push({ uuid, status: `error: ${err instanceof Error ? err.message : String(err)}` });
+      }
+    }
+    return jsonResult({ results, total: params.uuids.length, success: results.filter((r) => r.status === "retried").length });
   });
 
   server.tool("mass_skip_tasks", "Skip multiple MANUAL tasks at once. Do NOT use for automatic (automation-created) tasks.", {
     uuids: z.array(z.string()).describe("Array of manual task UUIDs to skip"),
   }, async (params) => {
-    const result = await grinfiRequest("PUT", "/flows/api/tasks/mass-skip", { uuids: params.uuids });
-    return jsonResult(result);
+    const results: Array<{ uuid: string; status: string }> = [];
+    for (const uuid of params.uuids) {
+      try {
+        const task = await grinfiRequest("GET", `/flows/api/tasks/${uuid}`) as { automation?: string };
+        if (task.automation !== "manual") {
+          results.push({ uuid, status: "BLOCKED: automatic task — skipped" });
+          continue;
+        }
+        await grinfiRequest("PUT", `/flows/api/tasks/${uuid}/skip`);
+        results.push({ uuid, status: "skipped" });
+      } catch (err) {
+        results.push({ uuid, status: `error: ${err instanceof Error ? err.message : String(err)}` });
+      }
+    }
+    return jsonResult({ results, total: params.uuids.length, success: results.filter((r) => r.status === "skipped").length });
   });
 
   server.tool(
     "get_tasks_group_counts",
-    "Get task counts grouped by status. Use automation='manual' for manual tasks.",
+    "Get task counts grouped by status. Defaults to manual tasks.",
     {
-      automation: z.enum(["manual", "auto"]).optional(),
+      automation: z.enum(["manual", "auto"]).optional().describe("Defaults to 'manual'"),
       schedule_at_before: z.string().optional(),
       schedule_at_after: z.string().optional(),
     },
     async (params) => {
       const query: Record<string, string> = {};
-      if (params.automation) query["filter[automation]"] = params.automation;
+      query["filter[automation]"] = params.automation ?? "manual";
       if (params.schedule_at_before) query["filter[schedule_at_before]"] = params.schedule_at_before;
       if (params.schedule_at_after) query["filter[schedule_at_after]"] = params.schedule_at_after;
       const result = await grinfiRequest("GET", "/flows/api/tasks/group-counts", undefined, query);
