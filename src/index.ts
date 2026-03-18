@@ -690,12 +690,12 @@ function createMcpServer(): McpServer {
   // ===========================
 
   server.tool("list_webhooks", "List all webhooks configured in your account.", {}, async () => {
-    const result = await grinfiRequest("GET", "/leads/api/webhooks");
+    const result = await grinfiRequest("GET", "/integrations/c1/api/webhooks");
     return jsonResult(result);
   });
 
   server.tool("get_webhook", "Get a webhook by UUID.", { uuid: z.string().describe("UUID of the webhook") }, async (params) => {
-    const result = await grinfiRequest("GET", `/leads/api/webhooks/${params.uuid}`);
+    const result = await grinfiRequest("GET", `/integrations/c1/api/webhooks/${params.uuid}`);
     return jsonResult(result);
   });
 
@@ -706,7 +706,8 @@ function createMcpServer(): McpServer {
     request_method: z.string().optional().describe("HTTP method (default: POST)"),
     filters: z.string().optional().describe("Optional filters"),
   }, async (params) => {
-    const result = await grinfiRequest("POST", "/leads/api/webhooks", params);
+    const body = { ...params, request_method: params.request_method || "POST" };
+    const result = await grinfiRequest("POST", "/integrations/c1/api/webhooks", body);
     return jsonResult(result);
   });
 
@@ -719,12 +720,12 @@ function createMcpServer(): McpServer {
     const { uuid, ...fields } = params;
     const body: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(fields)) { if (v !== undefined) body[k] = v; }
-    const result = await grinfiRequest("PUT", `/leads/api/webhooks/${uuid}`, body);
+    const result = await grinfiRequest("PUT", `/integrations/c1/api/webhooks/${uuid}`, body);
     return jsonResult(result);
   });
 
   server.tool("delete_webhook", "Delete a webhook by UUID.", { uuid: z.string().describe("UUID of the webhook to delete") }, async (params) => {
-    const result = await grinfiRequest("DELETE", `/leads/api/webhooks/${params.uuid}`);
+    const result = await grinfiRequest("DELETE", `/integrations/c1/api/webhooks/${params.uuid}`);
     return jsonResult(result);
   });
 
@@ -734,7 +735,7 @@ function createMcpServer(): McpServer {
     request_method: z.string().optional(),
     lead_uuid: z.string().optional(),
   }, async (params) => {
-    const result = await grinfiRequest("POST", "/leads/api/webhooks/test", params);
+    const result = await grinfiRequest("POST", "/integrations/c1/api/webhooks/test", params);
     return jsonResult(result);
   });
 
@@ -742,7 +743,7 @@ function createMcpServer(): McpServer {
     uuids: z.array(z.string()).describe("Array of webhook UUIDs"),
     metrics: z.array(z.string()).optional(),
   }, async (params) => {
-    const result = await grinfiRequest("POST", "/leads/api/webhooks/metrics", params);
+    const result = await grinfiRequest("POST", "/integrations/c1/api/webhooks/metrics", params);
     return jsonResult(result);
   });
 
