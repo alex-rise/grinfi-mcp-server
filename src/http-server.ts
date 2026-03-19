@@ -2109,11 +2109,16 @@ function extractAuth(req: IncomingMessage): AuthResult {
     if (tenantApiKey) {
       return { authorized: true, mcpPath: true, grinfiApiKey: tenantApiKey };
     }
+    // Check OAuth access tokens
+    const oauthJwt = getGrinfiJwtByAccessToken(token);
+    if (oauthJwt) {
+      return { authorized: true, mcpPath: true, grinfiApiKey: oauthJwt };
+    }
     return { authorized: false, mcpPath: true };
   }
 
-  // Pattern 2: /mcp with Authorization: Bearer {key} (standard MCP)
-  if (url === "/mcp") {
+  // Pattern 2: /mcp or / with Authorization: Bearer {key} (standard MCP + OAuth)
+  if (url === "/mcp" || url === "/" || url === "/mcp/") {
     const authHeader = req.headers.authorization;
     if (authHeader) {
       const bearerToken = authHeader.replace(/^Bearer\s+/i, "");
@@ -2195,7 +2200,6 @@ loadOAuthTokens();
 // --- HTTP Server ---
 const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse) => {
   const url = req.url ?? "";
-
   // --- OAuth 2.1 Endpoints ---
   const parsedOAuthUrl = new URL(url, "http://localhost");
   const ISSUER = "https://mcp.grinfi.io";
@@ -2287,9 +2291,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .field{margin-bottom:16px}
 .field label{display:block;font-size:14px;font-weight:500;color:#333;margin-bottom:6px}
 .field input{width:100%;padding:10px 12px;border:1px solid #ddd;border-radius:8px;font-size:14px;outline:none;transition:border-color 0.2s}
-.field input:focus{border-color:#5b3cc4}
-.btn{width:100%;padding:12px;background:#5b3cc4;color:#fff;border:none;border-radius:8px;font-size:16px;font-weight:600;cursor:pointer;transition:background 0.2s}
+.field input:focus{border-color:#0ba10c}
+.btn{width:100%;padding:12px;background:#0ba10c;color:#fff;border:none;border-radius:8px;font-size:16px;font-weight:600;cursor:pointer;transition:background 0.2s}
 .btn:hover{background:#4a2db3}
+.permissions{background:#f0fdf0;border:1px solid #0ba10c33;border-radius:8px;padding:14px 16px;margin-bottom:20px}
+.perm-title{font-weight:600;font-size:13px;color:#1a1a2e;margin-bottom:8px}
+.permissions ul{list-style:none;padding:0;margin:0}
+.permissions li{font-size:13px;color:#444;padding:3px 0}
 .error{color:#e53e3e;font-size:13px;margin-top:12px;text-align:center;display:none}
 </style>
 </head>
@@ -2323,15 +2331,14 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
     return;
   }
 
-  // Authorization Endpoint - POST (handle login form)
+  // Authorization Endpoint - POST (handle login form or team selection)
   if (parsedOAuthUrl.pathname === "/oauth/authorize" && req.method === "POST") {
     try {
       const chunks: Buffer[] = [];
       for await (const chunk of req) chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
       const bodyStr = Buffer.concat(chunks).toString();
       const formParams = new URLSearchParams(bodyStr);
-      const email = formParams.get("email") ?? "";
-      const password = formParams.get("password") ?? "";
+
       const clientId = formParams.get("client_id") ?? "";
       const redirectUri = formParams.get("redirect_uri") ?? "";
       const state = formParams.get("state") ?? "";
@@ -2346,32 +2353,185 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
         return;
       }
 
-      // Authenticate via Grinfi login API
-      const loginResp = await fetch("https://leadgen.grinfi.io/id/api/users/get-jwt-token", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email, password }),
-      });
+      // Check if this is a team selection (step 2) or login (step 1)
+      const selectedTeamId = formParams.get("team_id");
+      const sessionToken = formParams.get("session_token");
 
-      if (!loginResp.ok) {
-        // Show error page
-        res.writeHead(401, { "Content-Type": "text/html; charset=utf-8" });
-        res.end(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Error</title>
+      let sessionJwt: string;
+
+      if (selectedTeamId && sessionToken) {
+        // Step 2: team was selected, use existing session token
+        sessionJwt = sessionToken;
+        console.log("OAuth: team selected:", selectedTeamId);
+      } else {
+        // Step 1: login with email/password
+        const email = formParams.get("email") ?? "";
+        const password = formParams.get("password") ?? "";
+
+        const loginResp = await fetch("https://leadgen.grinfi.io/id/api/users/get-jwt-token", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email, password }),
+        });
+
+        if (!loginResp.ok) {
+          res.writeHead(401, { "Content-Type": "text/html; charset=utf-8" });
+          res.end(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Error</title>
 <style>body{font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;background:#f5f5f5}
 .card{background:#fff;border-radius:12px;padding:40px;max-width:400px;text-align:center;box-shadow:0 2px 10px rgba(0,0,0,0.1)}
-h1{color:#e53e3e;margin-bottom:12px}a{color:#5b3cc4}</style></head>
+h1{color:#e53e3e;margin-bottom:12px}a{color:#0ba10c}</style></head>
 <body><div class="card"><h1>Login Failed</h1><p>Invalid email or password.</p><p style="margin-top:16px"><a href="javascript:history.back()">Try again</a></p></div></body></html>`);
-        return;
+          return;
+        }
+
+        const loginData = await loginResp.json() as { token?: string; jwt_token?: string; data?: { token?: string } };
+        sessionJwt = (loginData.token ?? loginData.jwt_token ?? (loginData.data as Record<string, unknown>)?.token) as string;
+
+        if (!sessionJwt) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "no_token_received" }));
+          return;
+        }
+
+        // Decode JWT to check how many teams user has
+        let userTeams: Record<string, number> = {};
+        try {
+          const jwtPayload = JSON.parse(Buffer.from(sessionJwt.split(".")[1], "base64").toString());
+          userTeams = (jwtPayload.user_teams as Record<string, number>) ?? {};
+          console.log("OAuth: user logged in:", jwtPayload.usr?.email, "teams:", Object.keys(userTeams).length);
+        } catch (e) {
+          console.error("OAuth: failed to decode JWT:", e);
+        }
+
+        const teamIds = Object.keys(userTeams);
+
+        // If user has multiple teams, show team selection page
+        if (teamIds.length > 1) {
+          // Fetch team names from API
+          let teams: Array<{ id: string; name: string }> = teamIds.map((id) => ({ id, name: `Team ${id}` }));
+          try {
+            // Build teams from JWT user_teams (complete list) + API names where available
+            const jwtTeamIds = Object.keys(userTeams);
+            
+            // Fetch one page from API to get names for recent teams
+            const nameMap = new Map<string, string>();
+            const teamsResp = await fetch("https://leadgen.grinfi.io/id/api/teams", {
+              headers: { Authorization: `Bearer ${sessionJwt}` },
+            });
+            if (teamsResp.ok) {
+              const teamsData = (await teamsResp.json()) as { data?: Array<{ id: number; name: string }> } | Array<{ id: number; name: string }>;
+              const teamsArr = Array.isArray(teamsData) ? teamsData : teamsData.data ?? [];
+              for (const t of teamsArr) {
+                nameMap.set(String(t.id), t.name || `Team ${t.id}`);
+              }
+            }
+            
+            // Use all JWT team IDs, with names from API where available
+            teams = jwtTeamIds.map((id) => ({
+              id,
+              name: nameMap.get(id) || `Team ${id}`,
+            }));
+            // Sort: named teams first (descending by id), then unnamed (descending by id)
+            teams.sort((a, b) => {
+              const aHasName = !a.name.startsWith("Team ");
+              const bHasName = !b.name.startsWith("Team ");
+              if (aHasName && !bHasName) return -1;
+              if (!aHasName && bHasName) return 1;
+              return Number(b.id) - Number(a.id);
+            });
+            console.log("OAuth: built", teams.length, "teams from JWT,", nameMap.size, "with names from API");
+          } catch (e) {
+            console.error("OAuth: failed to fetch teams:", e);
+          }
+
+          const teamOptions = teams
+            .map((t) => `<option value="${t.id}">${t.id} — ${t.name}</option>`)
+            .join("\n              ");
+
+          res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+          res.end(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Select Team — Grinfi MCP</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:linear-gradient(135deg,#0ba10c 0%,#089a09 100%);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+.card{background:#fff;border-radius:16px;padding:40px;width:100%;max-width:420px;box-shadow:0 20px 60px rgba(0,0,0,0.15)}
+h1{font-size:22px;color:#1a1a2e;margin-bottom:8px;text-align:center}
+p{color:#666;font-size:14px;margin-bottom:24px;text-align:center}
+.select{width:100%;padding:12px;border:1px solid #e2e8f0;border-radius:8px;font-size:15px;color:#1a1a2e;background:#fff;appearance:auto}
+.select:focus{outline:none;border-color:#0ba10c}
+</style></head>
+<body>
+<div class="card">
+  <h1>Select Team</h1>
+  <p>Choose which team to connect with Claude</p>
+  <form method="POST" action="/oauth/authorize">
+    <input type="hidden" name="client_id" value="${clientId}">
+    <input type="hidden" name="redirect_uri" value="${redirectUri}">
+    <input type="hidden" name="state" value="${state}">
+    <input type="hidden" name="code_challenge" value="${codeChallenge}">
+    <input type="hidden" name="code_challenge_method" value="${codeChallengeMethod}">
+    <input type="hidden" name="scope" value="${scope}">
+    <input type="hidden" name="session_token" value="${sessionJwt}">
+    <div class="field">
+      <label for="team_id">Team</label>
+      <select name="team_id" id="team_id" class="select">
+              ${teamOptions}
+      </select>
+    </div>
+    <button type="submit" class="btn">Connect</button>
+  </form>
+</div>
+</body></html>`);
+          return;
+        }
+
+        // Single team — auto-select it
+        if (teamIds.length === 1) {
+          // Continue with this team ID below
+          (formParams as unknown as Map<string, string>).set("team_id", teamIds[0]);
+        }
       }
 
-      const loginData = await loginResp.json() as { token?: string; jwt_token?: string; data?: { token?: string } };
-      const jwt = loginData.token ?? loginData.jwt_token ?? (loginData.data as Record<string, unknown>)?.token as string | undefined;
+      // At this point we have sessionJwt and optionally a team_id
+      const teamId = formParams.get("team_id") ?? selectedTeamId ?? "";
 
-      if (!jwt) {
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "no_token_received" }));
-        return;
+      // Decode JWT for logging
+      try {
+        const jwtPayload = JSON.parse(Buffer.from(sessionJwt.split(".")[1], "base64").toString());
+        const finalTeam = teamId || String(jwtPayload.specific_team_id ?? "");
+        console.log("OAuth: creating API key for team:", finalTeam, "user:", jwtPayload.usr?.email);
+      } catch {}
+
+      // Create a persistent API key
+      const apiKeyHeaders: Record<string, string> = {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${sessionJwt}`,
+      };
+      if (teamId) apiKeyHeaders["Team-ID"] = teamId;
+
+      const apiKeyResp = await fetch("https://leadgen.grinfi.io/id/api/jwt-tokens/create-api-key", {
+        method: "POST",
+        headers: apiKeyHeaders,
+        body: JSON.stringify({ name: `Claude MCP (${new Date().toISOString().slice(0, 10)})` }),
+      });
+
+      let grinfiApiKey: string;
+      if (apiKeyResp.ok) {
+        const apiKeyData = (await apiKeyResp.json()) as Record<string, unknown>;
+        console.log("OAuth: API key created, type:", apiKeyData.type, "jti:", apiKeyData.jti);
+        grinfiApiKey =
+          (apiKeyData.last_token as string) ??
+          (apiKeyData.token as string) ??
+          (apiKeyData.jwt_token as string) ??
+          ((apiKeyData.data as Record<string, unknown>)?.last_token as string) ??
+          ((apiKeyData.data as Record<string, unknown>)?.token as string) ??
+          (sessionJwt as string);
+      } else {
+        const errBody = await apiKeyResp.text();
+        console.error("OAuth: API key creation failed:", apiKeyResp.status, errBody);
+        grinfiApiKey = sessionJwt as string;
       }
+      console.log("OAuth: using key type:", grinfiApiKey === sessionJwt ? "session-jwt-fallback" : "persistent-api-key");
 
       // Generate authorization code
       const code = createAuthCode({
@@ -2379,7 +2539,7 @@ h1{color:#e53e3e;margin-bottom:12px}a{color:#5b3cc4}</style></head>
         redirectUri,
         codeChallenge,
         codeChallengeMethod,
-        grinfiJwt: jwt as string,
+        grinfiJwt: grinfiApiKey,
         scope,
       });
 
@@ -2438,7 +2598,9 @@ h1{color:#e53e3e;margin-bottom:12px}a{color:#5b3cc4}</style></head>
           return;
         }
 
+        console.log("OAuth: exchanging code for tokens, clientId:", clientId);
         const tokens = issueTokens({ clientId, grinfiJwt: authCode.grinfiJwt, scope: authCode.scope });
+        console.log("OAuth: tokens issued for client:", clientId);
         res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
         res.end(JSON.stringify(tokens));
         return;
