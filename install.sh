@@ -86,19 +86,52 @@ else
     echo -e "${GREEN}OK${NC} Node.js $(node -v) installed"
 fi
 
-# ----- API Key -----
+# ----- API Key(s) -----
 echo ""
-echo -e "${BOLD}Enter your Grinfi API key${NC}"
-echo -e "  Get it from: ${CYAN}https://leadgen.grinfi.io/settings/api-keys${NC}"
+echo -e "${BOLD}How many Grinfi teams do you want to connect?${NC}"
+echo -e "  ${CYAN}1${NC}) Single team (one API key)"
+echo -e "  ${CYAN}2${NC}) Multiple teams (switch between teams inside Claude)"
 echo ""
-read -rp "  API Key: " GRINFI_API_KEY
+read -rp "  Enter 1 or 2 [default: 1]: " TEAM_MODE
+TEAM_MODE="${TEAM_MODE:-1}"
 
-if [ -z "$GRINFI_API_KEY" ]; then
-    echo -e "${RED}API key cannot be empty.${NC}"
-    exit 1
-fi
+GRINFI_API_KEY=""
+GRINFI_TEAM_KEYS=""
+GRINFI_ACTIVE_TEAM=""
 
-echo -e "${GREEN}OK${NC} API key saved"
+if [ "$TEAM_MODE" = "2" ]; then
+    echo ""
+    echo -e "${BOLD}Enter team API keys${NC} (format: ${CYAN}teamId:apiKey${NC})"
+    echo -e "  Team ID: ${CYAN}https://leadgen.grinfi.io/settings/team${NC}"
+    echo -e "  API Key: ${CYAN}https://leadgen.grinfi.io/settings/api-keys${NC}"
+    echo -e "  Type ${CYAN}done${NC} when finished."
+    echo ""
+    PAIRS=()
+    while true; do
+        read -rp "  teamId:apiKey (or 'done'): " PAIR
+        [ "$PAIR" = "done" ] && break
+        [ -z "$PAIR" ] && continue
+        PAIRS+=("$PAIR")
+    done
+    if [ ${#PAIRS[@]} -eq 0 ]; then
+        echo -e "${RED}No teams entered.${NC}"
+        exit 1
+    fi
+    GRINFI_TEAM_KEYS=$(IFS=,; echo "${PAIRS[*]}")
+    GRINFI_ACTIVE_TEAM="${PAIRS[0]%%:*}"
+    echo -e "${GREEN}OK${NC} ${#PAIRS[@]} team(s) saved"
+else
+    echo ""
+    echo -e "${BOLD}Enter your Grinfi API key${NC}"
+    echo -e "  Get it from: ${CYAN}https://leadgen.grinfi.io/settings/api-keys${NC}"
+    echo ""
+    read -rp "  API Key: " GRINFI_API_KEY
+    if [ -z "$GRINFI_API_KEY" ]; then
+        echo -e "${RED}API key cannot be empty.${NC}"
+        exit 1
+    fi
+    echo -e "${GREEN}OK${NC} API key saved"
+fi"
 
 # ----- Install & Build -----
 echo ""
@@ -128,7 +161,20 @@ CONFIG_FILE="$CLAUDE_CONFIG_DIR/claude_desktop_config.json"
 if [ -n "$CLAUDE_CONFIG_DIR" ]; then
     mkdir -p "$CLAUDE_CONFIG_DIR"
 
-    NEW_SERVER=$(cat <<JSONEOF
+    if [ "$TEAM_MODE" = "2" ]; then
+        NEW_SERVER=$(cat <<JSONEOF
+{
+    "command": "node",
+    "args": ["$SERVER_PATH"],
+    "env": {
+        "GRINFI_TEAM_KEYS": "$GRINFI_TEAM_KEYS",
+        "GRINFI_ACTIVE_TEAM": "$GRINFI_ACTIVE_TEAM"
+    }
+}
+JSONEOF
+)
+    else
+        NEW_SERVER=$(cat <<JSONEOF
 {
     "command": "node",
     "args": ["$SERVER_PATH"],
@@ -138,6 +184,7 @@ if [ -n "$CLAUDE_CONFIG_DIR" ]; then
 }
 JSONEOF
 )
+    fi
 
     if [ -f "$CONFIG_FILE" ]; then
         if command -v python3 &> /dev/null; then

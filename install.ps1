@@ -83,20 +83,54 @@ if (-not $nodeOk) {
     Install-NodeJS
 }
 
-# ----- API Key -----
+# ----- API Key(s) -----
 Write-Host ""
-Write-Host "Enter your Grinfi API key" -ForegroundColor White
-Write-Host "  Get it from: https://leadgen.grinfi.io/settings/api-keys" -ForegroundColor Cyan
+Write-Host "How many Grinfi teams do you want to connect?" -ForegroundColor White
+Write-Host "  1) Single team (one API key)" -ForegroundColor Cyan
+Write-Host "  2) Multiple teams (switch between teams inside Claude)" -ForegroundColor Cyan
 Write-Host ""
-$apiKey = Read-Host "  API Key"
+$teamMode = Read-Host "  Enter 1 or 2 [default: 1]"
+if ([string]::IsNullOrWhiteSpace($teamMode)) { $teamMode = "1" }
 
-if ([string]::IsNullOrWhiteSpace($apiKey)) {
-    Write-Host "API key cannot be empty." -ForegroundColor Red
-    Read-Host "Press Enter to exit"
-    exit 1
+$apiKey = ""
+$teamKeys = ""
+$activeTeam = ""
+
+if ($teamMode -eq "2") {
+    Write-Host ""
+    Write-Host "Enter team API keys (format: teamId:apiKey)" -ForegroundColor White
+    Write-Host "  Team ID: https://leadgen.grinfi.io/settings/team" -ForegroundColor Cyan
+    Write-Host "  API Key: https://leadgen.grinfi.io/settings/api-keys" -ForegroundColor Cyan
+    Write-Host "  Type 'done' when finished." -ForegroundColor Cyan
+    Write-Host ""
+    $pairs = @()
+    while ($true) {
+        $pair = Read-Host "  teamId:apiKey (or 'done')"
+        if ($pair -eq "done") { break }
+        if ([string]::IsNullOrWhiteSpace($pair)) { continue }
+        $pairs += $pair
+    }
+    if ($pairs.Count -eq 0) {
+        Write-Host "No teams entered." -ForegroundColor Red
+        Read-Host "Press Enter to exit"
+        exit 1
+    }
+    $teamKeys = $pairs -join ","
+    $activeTeam = $pairs[0].Split(":")[0]
+    Write-Host "OK $($pairs.Count) team(s) saved" -ForegroundColor Green
+} else {
+    Write-Host ""
+    Write-Host "Enter your Grinfi API key" -ForegroundColor White
+    Write-Host "  Get it from: https://leadgen.grinfi.io/settings/api-keys" -ForegroundColor Cyan
+    Write-Host ""
+    $apiKey = Read-Host "  API Key"
+    if ([string]::IsNullOrWhiteSpace($apiKey)) {
+        Write-Host "API key cannot be empty." -ForegroundColor Red
+        Read-Host "Press Enter to exit"
+        exit 1
+    }
+    Write-Host "OK API key saved" -ForegroundColor Green
 }
-
-Write-Host "OK API key saved" -ForegroundColor Green
 
 # ----- Install & Build -----
 Write-Host ""
@@ -129,7 +163,19 @@ if (-not (Test-Path $claudeConfigDir)) {
 }
 
 # Build config as raw JSON string to avoid PowerShell serialization issues
-$grinfiBlock = @"
+if ($teamMode -eq "2") {
+    $grinfiBlock = @"
+{
+    "command": "node",
+    "args": ["$serverPath"],
+    "env": {
+        "GRINFI_TEAM_KEYS": "$teamKeys",
+        "GRINFI_ACTIVE_TEAM": "$activeTeam"
+    }
+}
+"@
+} else {
+    $grinfiBlock = @"
 {
     "command": "node",
     "args": ["$serverPath"],
@@ -138,6 +184,7 @@ $grinfiBlock = @"
     }
 }
 "@
+}
 
 if (Test-Path $configFile) {
     try {
