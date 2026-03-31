@@ -88,30 +88,30 @@ fi
 
 # ----- API Key(s) -----
 echo ""
-echo -e "${BOLD}How many Grinfi teams do you want to connect?${NC}"
-echo -e "  ${CYAN}1${NC}) Single team (one API key)"
-echo -e "  ${CYAN}2${NC}) Multiple teams (switch between teams inside Claude)"
+echo -e "${BOLD}Do you use multiple Grinfi teams?${NC}"
+echo -e "  If you manage multiple workspaces/clients in Grinfi, you can connect"
+echo -e "  all of them and switch between teams directly inside Claude."
 echo ""
-read -rp "  Enter 1 or 2 [default: 1]: " TEAM_MODE
-TEAM_MODE="${TEAM_MODE:-1}"
+read -rp "  Connect multiple teams? [y/N]: " MULTI_TEAM
 
 GRINFI_API_KEY=""
 GRINFI_TEAM_KEYS=""
 GRINFI_ACTIVE_TEAM=""
 
-if [ "$TEAM_MODE" = "2" ]; then
+if [[ "$MULTI_TEAM" =~ ^[Yy] ]]; then
     echo ""
-    echo -e "${BOLD}Enter team API keys${NC} (format: ${CYAN}teamId:apiKey${NC})"
+    echo -e "${BOLD}Add your teams one by one.${NC}"
+    echo -e "  Format: ${CYAN}teamId:apiKey${NC}"
     echo -e "  Team ID: ${CYAN}https://leadgen.grinfi.io/settings/team${NC}"
     echo -e "  API Key: ${CYAN}https://leadgen.grinfi.io/settings/api-keys${NC}"
-    echo -e "  Type ${CYAN}done${NC} when finished."
+    echo -e "  Press ${CYAN}Enter${NC} on empty line when done."
     echo ""
     PAIRS=()
     while true; do
-        read -rp "  teamId:apiKey (or 'done'): " PAIR
-        [ "$PAIR" = "done" ] && break
-        [ -z "$PAIR" ] && continue
+        read -rp "  Team $((${#PAIRS[@]}+1)) — teamId:apiKey (or Enter to finish): " PAIR
+        [ -z "$PAIR" ] && break
         PAIRS+=("$PAIR")
+        echo -e "  ${GREEN}Added${NC} team ${PAIR%%:*}"
     done
     if [ ${#PAIRS[@]} -eq 0 ]; then
         echo -e "${RED}No teams entered.${NC}"
@@ -119,7 +119,7 @@ if [ "$TEAM_MODE" = "2" ]; then
     fi
     GRINFI_TEAM_KEYS=$(IFS=,; echo "${PAIRS[*]}")
     GRINFI_ACTIVE_TEAM="${PAIRS[0]%%:*}"
-    echo -e "${GREEN}OK${NC} ${#PAIRS[@]} team(s) saved"
+    echo -e "${GREEN}OK${NC} ${#PAIRS[@]} team(s) configured"
 else
     echo ""
     echo -e "${BOLD}Enter your Grinfi API key${NC}"

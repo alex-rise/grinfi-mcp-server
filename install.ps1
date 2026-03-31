@@ -85,30 +85,29 @@ if (-not $nodeOk) {
 
 # ----- API Key(s) -----
 Write-Host ""
-Write-Host "How many Grinfi teams do you want to connect?" -ForegroundColor White
-Write-Host "  1) Single team (one API key)" -ForegroundColor Cyan
-Write-Host "  2) Multiple teams (switch between teams inside Claude)" -ForegroundColor Cyan
+Write-Host "Do you use multiple Grinfi teams?" -ForegroundColor White
+Write-Host "  If you manage multiple workspaces/clients in Grinfi, you can connect" -ForegroundColor Gray
+Write-Host "  all of them and switch between teams directly inside Claude." -ForegroundColor Gray
 Write-Host ""
-$teamMode = Read-Host "  Enter 1 or 2 [default: 1]"
-if ([string]::IsNullOrWhiteSpace($teamMode)) { $teamMode = "1" }
+$multiTeam = Read-Host "  Connect multiple teams? [y/N]"
 
 $apiKey = ""
 $teamKeys = ""
 $activeTeam = ""
 
-if ($teamMode -eq "2") {
+if ($multiTeam -match "^[Yy]") {
     Write-Host ""
-    Write-Host "Enter team API keys (format: teamId:apiKey)" -ForegroundColor White
+    Write-Host "Add your teams one by one (format: teamId:apiKey)" -ForegroundColor White
     Write-Host "  Team ID: https://leadgen.grinfi.io/settings/team" -ForegroundColor Cyan
     Write-Host "  API Key: https://leadgen.grinfi.io/settings/api-keys" -ForegroundColor Cyan
-    Write-Host "  Type 'done' when finished." -ForegroundColor Cyan
+    Write-Host "  Press Enter on empty line when done." -ForegroundColor Cyan
     Write-Host ""
     $pairs = @()
     while ($true) {
-        $pair = Read-Host "  teamId:apiKey (or 'done')"
-        if ($pair -eq "done") { break }
-        if ([string]::IsNullOrWhiteSpace($pair)) { continue }
+        $pair = Read-Host "  Team $($pairs.Count + 1) — teamId:apiKey (or Enter to finish)"
+        if ([string]::IsNullOrWhiteSpace($pair)) { break }
         $pairs += $pair
+        Write-Host "  Added team $($pair.Split(':')[0])" -ForegroundColor Green
     }
     if ($pairs.Count -eq 0) {
         Write-Host "No teams entered." -ForegroundColor Red
@@ -117,7 +116,7 @@ if ($teamMode -eq "2") {
     }
     $teamKeys = $pairs -join ","
     $activeTeam = $pairs[0].Split(":")[0]
-    Write-Host "OK $($pairs.Count) team(s) saved" -ForegroundColor Green
+    Write-Host "OK $($pairs.Count) team(s) configured" -ForegroundColor Green
 } else {
     Write-Host ""
     Write-Host "Enter your Grinfi API key" -ForegroundColor White
