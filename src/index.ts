@@ -3,11 +3,16 @@
 /**
  * Grinfi MCP server — stdio transport (for local CLI usage).
  *
- * Usage:
+ * Usage (single team):
  *   GRINFI_API_KEY=xxx node dist/index.js
  *
+ * Usage (multi-team):
+ *   GRINFI_TEAM_KEYS="134:key1,559:key2" GRINFI_ACTIVE_TEAM=134 node dist/index.js
+ *
  * Environment variables:
- *   GRINFI_API_KEY  - Your Grinfi API key (required)
+ *   GRINFI_API_KEY      - Your Grinfi API key (required for single-team mode)
+ *   GRINFI_TEAM_KEYS    - Comma-separated list of teamId:apiKey pairs (multi-team mode)
+ *   GRINFI_ACTIVE_TEAM  - Default active team ID (optional, defaults to first in GRINFI_TEAM_KEYS)
  */
 
 import { readFileSync } from "node:fs";
@@ -16,11 +21,34 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
+// --- Multi-team state ---
+
+interface TeamEntry { teamId: string; apiKey: string; }
+
+// Parse GRINFI_TEAM_KEYS="134:key1,559:key2"
+function parseTeamKeys(): TeamEntry[] {
+  const raw = process.env.GRINFI_TEAM_KEYS ?? "";
+  if (!raw) return [];
+  return raw.split(",").map(s => s.trim()).filter(Boolean).map(pair => {
+    const idx = pair.indexOf(":");
+    return { teamId: pair.slice(0, idx), apiKey: pair.slice(idx + 1) };
+  }).filter(e => e.teamId && e.apiKey);
+}
+
+const teamKeys: TeamEntry[] = parseTeamKeys();
+let activeTeamId: string = process.env.GRINFI_ACTIVE_TEAM ?? teamKeys[0]?.teamId ?? "";
+
 // --- Helpers ---
 
 const BASE_URL = "https://leadgen.grinfi.io";
 
 function getApiKey(): string {
+  // Multi-team mode
+  if (teamKeys.length > 0) {
+    const entry = teamKeys.find(e => e.teamId === activeTeamId) ?? teamKeys[0];
+    return entry.apiKey;
+  }
+  // Single-team mode
   const key = process.env.GRINFI_API_KEY;
   if (!key) {
     throw new Error(
@@ -1692,6 +1720,40 @@ function createMcpServer(): McpServer {
     const result = await grinfiRequest("GET", `/ai/api/llm-logs/${params.uuid}`);
     return jsonResult(result);
   });
+
+  // --- Multi-team tools (only registered when GRINFI_TEAM_KEYS is set) ---
+
+  if (teamKeys.length > 0) {
+    server.tool("list_my_teams", "List all Grinfi teams available in this connection and show which one is currently active.", {}, async () => {
+      return jsonResult({
+        mode: "multi-team",
+        active_team_id: activeTeamId,
+        teams: teamKeys.map(e => ({
+          team_id: e.teamId,
+          active: e.teamId === activeTeamId,
+        })),
+        hint: "Use switch_team tool with the team_id to switch between teams.",
+      });
+    });
+
+    server.tool("switch_team", "Switch the active Grinfi team. All subsequent tool calls will use the selected team's API key.", {
+      team_id: z.string().describe("Team ID to switch to"),
+    }, async (params) => {
+      const entry = teamKeys.find(e => e.teamId === params.team_id);
+      if (!entry) {
+        return jsonResult({
+          success: false,
+          error: `Team ${params.team_id} not found. Available teams: ${teamKeys.map(e => e.teamId).join(", ")}`,
+        });
+      }
+      activeTeamId = params.team_id;
+      return jsonResult({
+        success: true,
+        active_team_id: activeTeamId,
+        message: `Switched to team ${activeTeamId}. All subsequent operations will use this team.`,
+      });
+    });
+  }
 
   return server;
 }
