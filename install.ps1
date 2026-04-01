@@ -162,7 +162,7 @@ if (-not (Test-Path $claudeConfigDir)) {
 }
 
 # Build config as raw JSON string to avoid PowerShell serialization issues
-if ($teamMode -eq "2") {
+if ($multiTeam -match "^[Yy]") {
     $grinfiBlock = @"
 {
     "command": "node",
