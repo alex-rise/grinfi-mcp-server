@@ -25,13 +25,29 @@ import { z } from "zod";
 
 interface TeamEntry { teamId: string; apiKey: string; }
 
-// Parse GRINFI_TEAM_KEYS="134:key1,559:key2"
+// Extract team ID from JWT payload (specific_team_id field)
+function teamIdFromJwt(jwt: string): string {
+  try {
+    const payload = JSON.parse(Buffer.from(jwt.split(".")[1], "base64").toString());
+    return String(payload.specific_team_id ?? "");
+  } catch { return ""; }
+}
+
+// Parse GRINFI_TEAM_KEYS — supports both "teamId:apiKey" and plain "apiKey" formats
 function parseTeamKeys(): TeamEntry[] {
   const raw = process.env.GRINFI_TEAM_KEYS ?? "";
   if (!raw) return [];
-  return raw.split(",").map(s => s.trim()).filter(Boolean).map(pair => {
-    const idx = pair.indexOf(":");
-    return { teamId: pair.slice(0, idx), apiKey: pair.slice(idx + 1) };
+  return raw.split(",").map(s => s.trim()).filter(Boolean).map(apiKey => {
+    // If it looks like a JWT (contains dots, no colon before first dot), extract team ID from it
+    const firstDot = apiKey.indexOf(".");
+    const firstColon = apiKey.indexOf(":");
+    if (firstDot !== -1 && (firstColon === -1 || firstDot < firstColon)) {
+      const teamId = teamIdFromJwt(apiKey);
+      return { teamId, apiKey };
+    }
+    // Legacy "teamId:apiKey" format
+    const idx = firstColon;
+    return { teamId: apiKey.slice(0, idx), apiKey: apiKey.slice(idx + 1) };
   }).filter(e => e.teamId && e.apiKey);
 }
 

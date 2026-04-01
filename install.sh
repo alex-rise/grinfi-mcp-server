@@ -100,25 +100,23 @@ GRINFI_ACTIVE_TEAM=""
 
 if [[ "$MULTI_TEAM" =~ ^[Yy] ]]; then
     echo ""
-    echo -e "${BOLD}Add your teams one by one.${NC}"
-    echo -e "  Format: ${CYAN}teamId:apiKey${NC}"
-    echo -e "  Team ID: ${CYAN}https://leadgen.grinfi.io/settings/team${NC}"
-    echo -e "  API Key: ${CYAN}https://leadgen.grinfi.io/settings/api-keys${NC}"
+    echo -e "${BOLD}Paste an API key for each team.${NC}"
+    echo -e "  Get API keys from: ${CYAN}https://leadgen.grinfi.io/settings/api-keys${NC}"
     echo -e "  Press ${CYAN}Enter${NC} on empty line when done."
     echo ""
     PAIRS=()
     while true; do
-        read -rp "  Team $((${#PAIRS[@]}+1)) — teamId:apiKey (or Enter to finish): " PAIR
+        read -rp "  Team $((${#PAIRS[@]}+1)) API key (or Enter to finish): " PAIR
         [ -z "$PAIR" ] && break
         PAIRS+=("$PAIR")
-        echo -e "  ${GREEN}Added${NC} team ${PAIR%%:*}"
+        echo -e "  ${GREEN}Added${NC}"
     done
     if [ ${#PAIRS[@]} -eq 0 ]; then
-        echo -e "${RED}No teams entered.${NC}"
+        echo -e "${RED}No keys entered.${NC}"
         exit 1
     fi
     GRINFI_TEAM_KEYS=$(IFS=,; echo "${PAIRS[*]}")
-    GRINFI_ACTIVE_TEAM="${PAIRS[0]%%:*}"
+    GRINFI_ACTIVE_TEAM=""
     echo -e "${GREEN}OK${NC} ${#PAIRS[@]} team(s) configured"
 else
     echo ""
