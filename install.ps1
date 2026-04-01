@@ -97,25 +97,24 @@ $activeTeam = ""
 
 if ($multiTeam -match "^[Yy]") {
     Write-Host ""
-    Write-Host "Add your teams one by one (format: teamId:apiKey)" -ForegroundColor White
-    Write-Host "  Team ID: https://leadgen.grinfi.io/settings/team" -ForegroundColor Cyan
-    Write-Host "  API Key: https://leadgen.grinfi.io/settings/api-keys" -ForegroundColor Cyan
+    Write-Host "Paste an API key for each team." -ForegroundColor White
+    Write-Host "  Get API keys from: https://leadgen.grinfi.io/settings/api-keys" -ForegroundColor Cyan
     Write-Host "  Press Enter on empty line when done." -ForegroundColor Cyan
     Write-Host ""
     $pairs = @()
     while ($true) {
-        $pair = Read-Host "  Team $($pairs.Count + 1) — teamId:apiKey (or Enter to finish)"
+        $pair = Read-Host "  Team $($pairs.Count + 1) API key (or Enter to finish)"
         if ([string]::IsNullOrWhiteSpace($pair)) { break }
         $pairs += $pair
-        Write-Host "  Added team $($pair.Split(':')[0])" -ForegroundColor Green
+        Write-Host "  Added" -ForegroundColor Green
     }
     if ($pairs.Count -eq 0) {
-        Write-Host "No teams entered." -ForegroundColor Red
+        Write-Host "No keys entered." -ForegroundColor Red
         Read-Host "Press Enter to exit"
         exit 1
     }
     $teamKeys = $pairs -join ","
-    $activeTeam = $pairs[0].Split(":")[0]
+    $activeTeam = ""
     Write-Host "OK $($pairs.Count) team(s) configured" -ForegroundColor Green
 } else {
     Write-Host ""
