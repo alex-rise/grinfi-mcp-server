@@ -131,7 +131,7 @@ else
         exit 1
     fi
     echo -e "${GREEN}OK${NC} API key saved"
-fi"
+fi
 
 # ----- Install & Build -----
 echo ""
@@ -161,7 +161,7 @@ CONFIG_FILE="$CLAUDE_CONFIG_DIR/claude_desktop_config.json"
 if [ -n "$CLAUDE_CONFIG_DIR" ]; then
     mkdir -p "$CLAUDE_CONFIG_DIR"
 
-    if [ "$TEAM_MODE" = "2" ]; then
+    if [[ "$MULTI_TEAM" =~ ^[Yy] ]]; then
         NEW_SERVER=$(cat <<JSONEOF
 {
     "command": "node",
