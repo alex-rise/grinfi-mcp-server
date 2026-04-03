@@ -1535,10 +1535,24 @@ function createMcpServer(): McpServer {
   server.tool("create_sender_profile", "Create a new sender profile.", {
     first_name: z.string(), last_name: z.string(),
     label: z.string().optional(), assignee_user_id: z.number().optional(),
+    smart_limits_enabled: z.boolean().optional().describe("Whether smart sending limits are active"),
+    avatar_url: z.string().optional().describe("Profile photo URL"),
+    schedule: z.object({
+      timezone: z.string().describe("Timezone (e.g. Europe/Berlin)"),
+      use_lead_timezone: z.boolean().optional(),
+      timeblocks: z.array(z.object({
+        dow: z.number().describe("Day of week (0=Sunday, 1=Monday, …, 6=Saturday)"),
+        min: z.number().describe("Start time in minutes from midnight (e.g. 540 = 9:00)"),
+        max: z.number().describe("End time in minutes from midnight (e.g. 1080 = 18:00)"),
+      })),
+    }).optional().describe("Working hours schedule"),
   }, async (params) => {
     const body: Record<string, unknown> = { first_name: params.first_name, last_name: params.last_name };
     if (params.label) body.label = params.label;
     if (params.assignee_user_id !== undefined) body.assignee_user_id = params.assignee_user_id;
+    if (params.smart_limits_enabled !== undefined) body.smart_limits_enabled = params.smart_limits_enabled;
+    if (params.avatar_url) body.avatar_url = params.avatar_url;
+    if (params.schedule) body.schedule = params.schedule;
     const result = await grinfiRequest("POST", "/flows/api/sender-profiles", body);
     return jsonResult(result);
   });
@@ -1547,7 +1561,17 @@ function createMcpServer(): McpServer {
     uuid: z.string().describe("UUID of the sender profile to update"),
     first_name: z.string().optional(), last_name: z.string().optional(),
     label: z.string().optional(),
-    schedule: z.record(z.string(), z.unknown()).optional(),
+    smart_limits_enabled: z.boolean().optional().describe("Whether smart sending limits are active"),
+    avatar_url: z.string().nullable().optional().describe("Profile photo URL"),
+    schedule: z.object({
+      timezone: z.string().describe("Timezone (e.g. Europe/Berlin)"),
+      use_lead_timezone: z.boolean().optional(),
+      timeblocks: z.array(z.object({
+        dow: z.number().describe("Day of week (0=Sunday, 1=Monday, …, 6=Saturday)"),
+        min: z.number().describe("Start time in minutes from midnight (e.g. 540 = 9:00)"),
+        max: z.number().describe("End time in minutes from midnight (e.g. 1080 = 18:00)"),
+      })),
+    }).optional().describe("Working hours schedule"),
   }, async (params) => {
     const { uuid, ...fields } = params;
     const body: Record<string, unknown> = {};
@@ -1770,6 +1794,195 @@ function createMcpServer(): McpServer {
       });
     });
   }
+
+  // ===========================
+  // ACCOUNT
+  // ===========================
+
+  server.tool("get_current_user", "Get the current authenticated user's profile and configuration.", {}, async () => {
+    const result = await grinfiRequest("GET", "/id/api/users/current");
+    return jsonResult(result);
+  });
+
+  server.tool("list_teams", "List all teams (workspaces) available to the current user. Use to discover team IDs for switching.", {
+    limit: z.number().optional(), offset: z.number().optional(),
+  }, async (params) => {
+    const result = await grinfiRequest("GET", "/id/api/teams", undefined, buildQuery(params));
+    return jsonResult(result);
+  });
+
+  server.tool("get_team", "Get details of a specific team by numeric ID.", {
+    id: z.number().describe("Team ID (integer, not UUID)"),
+  }, async (params) => {
+    const result = await grinfiRequest("GET", `/id/api/teams/${params.id}`);
+    return jsonResult(result);
+  });
+
+  // ===========================
+  // LINKEDIN BROWSERS
+  // ===========================
+
+  server.tool("list_linkedin_browsers", "List all LinkedIn browser profiles with pagination.", {
+    limit: z.number().optional(), offset: z.number().optional(),
+    order_field: z.string().optional(), order_type: z.enum(["asc", "desc"]).optional(),
+  }, async (params) => {
+    const body: Record<string, unknown> = {};
+    if (params.limit !== undefined) body.limit = params.limit;
+    if (params.offset !== undefined) body.offset = params.offset;
+    if (params.order_field) body.order_field = params.order_field;
+    if (params.order_type) body.order_type = params.order_type;
+    const result = await grinfiRequest("POST", "/browsers/api/linkedin-browsers/list", body);
+    return jsonResult(result);
+  });
+
+  server.tool("get_linkedin_browser", "Get a LinkedIn browser profile by ID.", {
+    id: z.number().describe("LinkedIn browser ID (integer)"),
+  }, async (params) => {
+    const result = await grinfiRequest("GET", `/browsers/api/linkedin-browsers/${params.id}`);
+    return jsonResult(result);
+  });
+
+  server.tool("create_linkedin_browser", "Create a new LinkedIn browser profile linked to a sender profile.", {
+    sender_profile_uuid: z.string().describe("UUID of the sender profile to link"),
+    proxy_country_code: z.string().optional().describe("Proxy country code (e.g. US, DE)"),
+  }, async (params) => {
+    const body: Record<string, unknown> = { sender_profile_uuid: params.sender_profile_uuid };
+    if (params.proxy_country_code) body.proxy_country_code = params.proxy_country_code;
+    const result = await grinfiRequest("POST", "/browsers/api/linkedin-browsers", body);
+    return jsonResult(result);
+  });
+
+  server.tool("delete_linkedin_browser", "Delete a LinkedIn browser profile by ID. This action is irreversible.", {
+    id: z.number().describe("LinkedIn browser ID to delete"),
+  }, async (params) => {
+    const result = await grinfiRequest("DELETE", `/browsers/api/linkedin-browsers/${params.id}`);
+    return jsonResult(result);
+  });
+
+  server.tool("run_linkedin_browser", "Start a LinkedIn browser session to begin executing queued actions.", {
+    id: z.number().describe("LinkedIn browser ID"),
+  }, async (params) => {
+    const result = await grinfiRequest("POST", `/browsers/api/linkedin-browsers/${params.id}/run`);
+    return jsonResult(result);
+  });
+
+  server.tool("stop_linkedin_browser", "Stop a running LinkedIn browser session.", {
+    id: z.number().describe("LinkedIn browser ID"),
+  }, async (params) => {
+    const result = await grinfiRequest("POST", `/browsers/api/linkedin-browsers/${params.id}/stop`);
+    return jsonResult(result);
+  });
+
+  server.tool("set_linkedin_browser_proxy", "Change the proxy configuration for a LinkedIn browser.", {
+    id: z.number().describe("LinkedIn browser ID"),
+    proxy_country_code: z.string().describe("Proxy country code (e.g. US, DE)"),
+  }, async (params) => {
+    const result = await grinfiRequest("POST", `/browsers/api/linkedin-browsers/${params.id}/set-proxy`, {
+      proxy_country_code: params.proxy_country_code,
+    });
+    return jsonResult(result);
+  });
+
+  server.tool("share_linkedin_browser", "Share a LinkedIn browser profile with team members by email.", {
+    id: z.number().describe("LinkedIn browser ID"),
+    recipients: z.array(z.string()).describe("Email addresses of team members to share with"),
+  }, async (params) => {
+    const result = await grinfiRequest("POST", `/browsers/api/linkedin-browsers/${params.id}/share`, {
+      recipients: params.recipients,
+    });
+    return jsonResult(result);
+  });
+
+  // ===========================
+  // AUTOMATION FOLDERS
+  // ===========================
+
+  server.tool("list_automation_folders", "List all automation folders (workspaces) for organizing automations.", {}, async () => {
+    const result = await grinfiRequest("GET", "/flows/api/flow-workspaces");
+    return jsonResult(result);
+  });
+
+  server.tool("create_automation_folder", "Create a new automation folder.", {
+    name: z.string().describe("Name of the folder"),
+    order: z.number().optional().describe("Display order position"),
+  }, async (params) => {
+    const body: Record<string, unknown> = { name: params.name };
+    if (params.order !== undefined) body.order = params.order;
+    const result = await grinfiRequest("POST", "/flows/api/flow-workspaces", body);
+    return jsonResult(result);
+  });
+
+  server.tool("update_automation_folder", "Update an automation folder's name or display order.", {
+    uuid: z.string().describe("UUID of the automation folder"),
+    name: z.string().optional(),
+    order: z.number().optional(),
+  }, async (params) => {
+    const { uuid, ...fields } = params;
+    const body: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(fields)) { if (v !== undefined) body[k] = v; }
+    const result = await grinfiRequest("PUT", `/flows/api/flow-workspaces/${uuid}`, body);
+    return jsonResult(result);
+  });
+
+  server.tool("delete_automation_folder", "Delete an automation folder by UUID.", {
+    uuid: z.string().describe("UUID of the automation folder to delete"),
+  }, async (params) => {
+    const result = await grinfiRequest("DELETE", `/flows/api/flow-workspaces/${params.uuid}`);
+    return jsonResult(result);
+  });
+
+  // ===========================
+  // DATA SOURCES
+  // ===========================
+
+  server.tool("list_data_sources", "List LinkedIn import jobs (data sources) with pagination.", {
+    limit: z.number().optional(), offset: z.number().optional(),
+    order_field: z.string().optional(), order_type: z.enum(["asc", "desc"]).optional(),
+  }, async (params) => {
+    const result = await grinfiRequest("GET", "/leads/api/data-sources", undefined, buildQuery(params));
+    return jsonResult(result);
+  });
+
+  server.tool("get_data_source", "Get a data source (LinkedIn import job) by UUID.", {
+    uuid: z.string().describe("UUID of the data source"),
+  }, async (params) => {
+    const result = await grinfiRequest("GET", `/leads/api/data-sources/${params.uuid}`);
+    return jsonResult(result);
+  });
+
+  server.tool("create_data_source", "Create a new LinkedIn import job. Imports contacts from LinkedIn searches, lists, or Sales Navigator into a contact list.", {
+    type: z.enum(["csv_leads", "sn_leads_search", "sn_leads_saved_search", "sn_leads_list", "sn_accounts_search", "sn_accounts_saved_search", "sn_accounts_list", "ln_leads_search", "ln_accounts_search", "ln_my_network", "ln_my_messenger", "post_engagement", "recruiter_leads_search"]).describe("Type of import source"),
+    list_uuid: z.string().describe("UUID of the contact list to import into"),
+    payload: z.record(z.string(), z.unknown()).optional().describe("Import configuration specific to the data source type"),
+    tags: z.array(z.string()).optional().describe("Tags to apply to imported contacts"),
+  }, async (params) => {
+    const body: Record<string, unknown> = { type: params.type, list_uuid: params.list_uuid };
+    if (params.payload) body.payload = params.payload;
+    if (params.tags) body.tags = params.tags;
+    const result = await grinfiRequest("POST", "/leads/api/data-sources", body);
+    return jsonResult(result);
+  });
+
+  server.tool("update_data_source", "Update a data source by UUID.", {
+    uuid: z.string().describe("UUID of the data source"),
+    type: z.string().optional(),
+    list_uuid: z.string().optional(),
+    payload: z.record(z.string(), z.unknown()).optional(),
+    tags: z.array(z.string()).nullable().optional(),
+  }, async (params) => {
+    const { uuid, ...fields } = params;
+    const body: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(fields)) { if (v !== undefined) body[k] = v; }
+    const result = await grinfiRequest("PUT", `/leads/api/data-sources/${uuid}`, body);
+    return jsonResult(result);
+  });
+
+  server.tool("delete_data_source", "Delete a data source (import job) by UUID.", {
+    uuid: z.string().describe("UUID of the data source to delete"),
+  }, async (params) => {
+    const result = await grinfiRequest("DELETE", `/leads/api/data-sources/${params.uuid}`);
+    return jsonResult(result);
+  });
 
   return server;
 }
