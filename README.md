@@ -188,6 +188,56 @@ Visit **[mcp.grinfi.io](https://mcp.grinfi.io)** to generate your personal MCP e
 | `get_sender_profile` | Get sender profile details |
 | `create_sender_profile` | Create a new sender profile |
 
+### CSV Import / Export *(new in 1.1)*
+
+| Tool | Description |
+|------|-------------|
+| `upload_csv` | Upload a CSV file from local disk; returns a file_import UUID |
+| `import_leads_from_file` | Import contacts from an uploaded CSV with column mapping |
+| `import_companies_from_file` | Import companies from an uploaded CSV |
+| `export_leads_csv` | Queue a CSV export of contacts matching a filter |
+| `export_companies_csv` | Queue a CSV export of companies matching a filter |
+| `download_export` | Get the download payload for a queued export |
+
+### Lead Enrichment & Analytics *(new in 1.1)*
+
+| Tool | Description |
+|------|-------------|
+| `enrich_leads` | Trigger advanced LinkedIn enrichment for contacts |
+| `count_leads` | Count contacts matching a filter |
+| `get_leads_metrics` | Get team engagement metrics for contacts |
+
+### Automation Folders & Enrollment *(new in 1.1)*
+
+| Tool | Description |
+|------|-------------|
+| `list_flow_workspaces` | List automation folders |
+| `create_flow_workspace` | Create a new automation folder |
+| `update_flow_workspace` | Rename or update a folder |
+| `delete_flow_workspace` | Delete a folder (automations inside are not deleted) |
+| `list_flow_leads` | Search contacts enrolled in automations |
+| `delete_flow_lead_history` | Delete a contact's automation history (full erase) |
+
+### AI Agents & Templates — full CRUD *(new in 1.1)*
+
+| Tool | Description |
+|------|-------------|
+| `create_ai_agent` | Create a new AI agent |
+| `update_ai_agent` | Update an AI agent |
+| `delete_ai_agent` | Delete an AI agent |
+| `update_ai_template` | Update an AI template |
+| `delete_ai_template` | Delete an AI template |
+
+### Closures *(new in 1.1)*
+
+| Tool | Description |
+|------|-------------|
+| `upload_attachment` | Upload a local file as an attachment |
+| `remove_from_leads_blacklist` | Remove a contact from the leads blacklist |
+| `remove_from_companies_blacklist` | Remove a company from the companies blacklist |
+| `update_custom_field` | Rename a custom field or change order |
+| `delete_custom_field` | Delete a custom field (and all its values) |
+
 ---
 
 ## Example Conversations
