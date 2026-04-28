@@ -16,7 +16,8 @@
  */
 
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { readFile } from "node:fs/promises";
+import { basename, join } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -107,6 +108,52 @@ async function grinfiRequest(
 
   if (response.status === 204) {
     return { success: true, message: "Operation completed successfully (204 No Content)" };
+  }
+
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`Grinfi API error ${response.status}: ${text}`);
+  }
+
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { rawResponse: text };
+  }
+}
+
+// Multipart/form-data upload helper. Used for file imports and attachments.
+async function grinfiUpload(
+  path: string,
+  filePath: string,
+  fieldName = "file",
+  filename?: string,
+  extraFields?: Record<string, string>,
+): Promise<unknown> {
+  const buffer = await readFile(filePath);
+  const formData = new FormData();
+  // Buffer is Uint8Array-compatible; cast for stricter @types/node Blob signature.
+  formData.append(
+    fieldName,
+    new Blob([buffer as unknown as BlobPart]),
+    filename ?? basename(filePath),
+  );
+  if (extraFields) {
+    for (const [k, v] of Object.entries(extraFields)) formData.append(k, v);
+  }
+
+  const url = new URL(path, BASE_URL);
+  const response = await fetch(url.toString(), {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${getApiKey()}`,
+      Accept: "application/json",
+    },
+    body: formData,
+  });
+
+  if (response.status === 204) {
+    return { success: true, message: "Upload completed successfully (204 No Content)" };
   }
 
   const text = await response.text();
@@ -1736,6 +1783,411 @@ function createMcpServer(): McpServer {
     const result = await grinfiRequest("GET", `/ai/api/llm-logs/${params.uuid}`);
     return jsonResult(result);
   });
+
+  // ===========================
+  // CSV IMPORT / EXPORT (file operations)
+  // ===========================
+
+  server.tool(
+    "upload_csv",
+    "Upload a CSV file to Grinfi. Returns a file_import UUID that you then pass to import_leads_from_file or import_companies_from_file. The file_path must be an absolute path on the local machine where the MCP server is running.",
+    {
+      file_path: z.string().describe("Absolute path to the CSV file on the local machine"),
+      filename: z.string().optional().describe("Override the filename sent to Grinfi (defaults to the basename of file_path)"),
+    },
+    async (params) => {
+      const result = await grinfiUpload(
+        "/leads/api/file-imports/upload-csv",
+        params.file_path,
+        "file",
+        params.filename,
+      );
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "import_leads_from_file",
+    "Import contacts (leads) from a previously uploaded CSV. Provide the file_import_uuid from upload_csv along with column mapping and target list/data source.",
+    {
+      file_import_uuid: z.string().describe("UUID returned by upload_csv"),
+      list_uuid: z.string().describe("Target list UUID for imported contacts"),
+      column_mapping: z.record(z.string(), z.string()).describe("Map CSV column names to Grinfi field names (e.g. {\"Email\":\"email\",\"Full Name\":\"name\"})"),
+      data_source_uuid: z.string().optional().describe("Optional data source to assign to imported contacts"),
+      update_if_exists: z.boolean().optional(),
+      move_to_list: z.boolean().optional(),
+      skip_first_row: z.boolean().optional().describe("Skip header row (default true)"),
+    },
+    async (params) => {
+      const { file_import_uuid, ...rest } = params;
+      const body: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(rest)) { if (v !== undefined) body[k] = v; }
+      const result = await grinfiRequest("POST", `/leads/api/file-imports/${file_import_uuid}/import-leads`, body);
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "import_companies_from_file",
+    "Import companies from a previously uploaded CSV. Provide the file_import_uuid from upload_csv along with column mapping.",
+    {
+      file_import_uuid: z.string().describe("UUID returned by upload_csv"),
+      column_mapping: z.record(z.string(), z.string()).describe("Map CSV column names to Grinfi company field names"),
+      list_uuids: z.array(z.string()).optional().describe("Optional list UUIDs to assign companies to"),
+      data_source_uuid: z.string().optional(),
+      update_if_exists: z.boolean().optional(),
+      skip_first_row: z.boolean().optional(),
+    },
+    async (params) => {
+      const { file_import_uuid, ...rest } = params;
+      const body: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(rest)) { if (v !== undefined) body[k] = v; }
+      const result = await grinfiRequest("POST", `/leads/api/file-imports/${file_import_uuid}/import-companies`, body);
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "export_leads_csv",
+    "Queue a CSV export of contacts matching a filter. Returns a file_export UUID. Use download_export to fetch the actual file once the export is ready.",
+    {
+      filter: z.record(z.string(), z.unknown()).optional().describe("Filter to select contacts to export"),
+      fields: z.array(z.string()).optional().describe("Specific fields to include in the export"),
+    },
+    async (params) => {
+      const body: Record<string, unknown> = {};
+      if (params.filter) body.filter = params.filter;
+      if (params.fields) body.fields = params.fields;
+      const result = await grinfiRequest("POST", "/leads/api/file-exports/leads", body);
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "export_companies_csv",
+    "Queue a CSV export of companies matching a filter. Returns a file_export UUID. Use download_export to fetch the actual file once the export is ready.",
+    {
+      filter: z.record(z.string(), z.unknown()).optional(),
+      fields: z.array(z.string()).optional(),
+    },
+    async (params) => {
+      const body: Record<string, unknown> = {};
+      if (params.filter) body.filter = params.filter;
+      if (params.fields) body.fields = params.fields;
+      const result = await grinfiRequest("POST", "/leads/api/file-exports/companies", body);
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "download_export",
+    "Get the download URL/payload for a previously queued export (from export_leads_csv or export_companies_csv). The export must be ready (job completed).",
+    {
+      file_export_uuid: z.string().describe("UUID returned by export_leads_csv or export_companies_csv"),
+    },
+    async (params) => {
+      const result = await grinfiRequest("POST", "/leads/api/file-exports/download", { uuid: params.file_export_uuid });
+      return jsonResult(result);
+    },
+  );
+
+  // ===========================
+  // LEAD ENRICHMENT & ANALYTICS
+  // ===========================
+
+  server.tool(
+    "enrich_leads",
+    "Trigger advanced LinkedIn enrichment for contacts. Provide either a filter or an array of lead UUIDs. Mirrors enrich_companies but for contacts.",
+    {
+      uuids: z.array(z.string()).optional().describe("Array of lead UUIDs to enrich"),
+      filter: z.record(z.string(), z.unknown()).optional().describe("Filter to select contacts to enrich"),
+    },
+    async (params) => {
+      const body: Record<string, unknown> = {};
+      if (params.uuids) body.uuids = params.uuids;
+      if (params.filter) body.filter = params.filter;
+      const result = await grinfiRequest("PUT", "/leads/api/leads/advanced-enrichment", body);
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "count_leads",
+    "Count contacts matching a filter. Useful for analytics or before running mass actions.",
+    {
+      filter: z.record(z.string(), z.unknown()).optional().describe("Filter to count by"),
+    },
+    async (params) => {
+      const body: Record<string, unknown> = {};
+      if (params.filter) body.filter = params.filter;
+      const result = await grinfiRequest("POST", "/leads/api/leads/count", body);
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "get_leads_metrics",
+    "Get team engagement metrics for contacts (counts, engagement, status breakdowns).",
+    {
+      filter: z.record(z.string(), z.unknown()).optional(),
+      metrics: z.array(z.string()).optional().describe("Specific metrics to retrieve"),
+    },
+    async (params) => {
+      const body: Record<string, unknown> = {};
+      if (params.filter) body.filter = params.filter;
+      if (params.metrics) body.metrics = params.metrics;
+      const result = await grinfiRequest("POST", "/leads/api/leads/metrics", body);
+      return jsonResult(result);
+    },
+  );
+
+  // ===========================
+  // FLOW WORKSPACES (automation folders)
+  // ===========================
+
+  server.tool(
+    "list_flow_workspaces",
+    "List automation folders (flow workspaces). Used to organize automations into groups.",
+    {
+      limit: z.number().optional(), offset: z.number().optional(),
+      order_field: z.string().optional(), order_type: z.enum(["asc", "desc"]).optional(),
+      search: z.string().optional(),
+    },
+    async (params) => {
+      const result = await grinfiRequest("GET", "/flows/api/flow-workspaces", undefined, buildQuery(params));
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "create_flow_workspace",
+    "Create a new automation folder.",
+    {
+      name: z.string().describe("Folder name"),
+      description: z.string().optional(),
+    },
+    async (params) => {
+      const body: Record<string, unknown> = { name: params.name };
+      if (params.description) body.description = params.description;
+      const result = await grinfiRequest("POST", "/flows/api/flow-workspaces", body);
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "update_flow_workspace",
+    "Rename or update an automation folder.",
+    {
+      uuid: z.string().describe("UUID of the flow workspace"),
+      name: z.string().optional(),
+      description: z.string().optional(),
+    },
+    async (params) => {
+      const { uuid, ...fields } = params;
+      const body: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(fields)) { if (v !== undefined) body[k] = v; }
+      const result = await grinfiRequest("PUT", `/flows/api/flow-workspaces/${uuid}`, body);
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "delete_flow_workspace",
+    "Delete an automation folder by UUID. Automations inside are not deleted, but become unfiled.",
+    {
+      uuid: z.string().describe("UUID of the flow workspace to delete"),
+    },
+    async (params) => {
+      const result = await grinfiRequest("DELETE", `/flows/api/flow-workspaces/${params.uuid}`);
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "list_flow_leads",
+    "Search contacts enrolled in automations. Returns which contacts are in which flows, along with status (active, paused, completed, failed).",
+    {
+      filter: z.record(z.string(), z.unknown()).optional().describe("Filter (e.g. by flow_uuid, lead_uuid, status)"),
+      limit: z.number().optional(), offset: z.number().optional(),
+      order_field: z.string().optional(), order_type: z.enum(["asc", "desc"]).optional(),
+    },
+    async (params) => {
+      const body: Record<string, unknown> = {};
+      if (params.filter) body.filter = params.filter;
+      if (params.limit !== undefined) body.limit = params.limit;
+      if (params.offset !== undefined) body.offset = params.offset;
+      if (params.order_field) body.order_field = params.order_field;
+      if (params.order_type) body.order_type = params.order_type;
+      const result = await grinfiRequest("POST", "/flows/api/flows-leads/list", body);
+      return jsonResult(result, true);
+    },
+  );
+
+  server.tool(
+    "delete_flow_lead_history",
+    "Delete a contact's automation history (removes them from ALL flows and clears enrollment records). Different from cancel_contact_from_all_automations: this also removes historical records.",
+    {
+      lead_uuid: z.string().describe("UUID of the contact"),
+    },
+    async (params) => {
+      const result = await grinfiRequest("DELETE", `/flows/api/flows/leads/${params.lead_uuid}`);
+      return jsonResult(result);
+    },
+  );
+
+  // ===========================
+  // AI AGENTS / TEMPLATES — CRUD
+  // ===========================
+
+  server.tool(
+    "create_ai_agent",
+    "Create a new AI agent. AI agents are configurable assistants that can be invoked from automations or templates.",
+    {
+      name: z.string().describe("Agent name"),
+      description: z.string().optional(),
+      llm_uuid: z.string().optional().describe("UUID of the LLM integration to use"),
+      system_prompt: z.string().optional(),
+      config: z.record(z.string(), z.unknown()).optional().describe("Provider-specific config"),
+    },
+    async (params) => {
+      const body: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(params)) { if (v !== undefined) body[k] = v; }
+      const result = await grinfiRequest("POST", "/ai/api/agents", body);
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "update_ai_agent",
+    "Update an AI agent by UUID.",
+    {
+      uuid: z.string().describe("UUID of the AI agent"),
+      name: z.string().optional(),
+      description: z.string().optional(),
+      llm_uuid: z.string().optional(),
+      system_prompt: z.string().optional(),
+      config: z.record(z.string(), z.unknown()).optional(),
+    },
+    async (params) => {
+      const { uuid, ...fields } = params;
+      const body: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(fields)) { if (v !== undefined) body[k] = v; }
+      const result = await grinfiRequest("PUT", `/ai/api/agents/${uuid}`, body);
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "delete_ai_agent",
+    "Delete an AI agent by UUID.",
+    { uuid: z.string().describe("UUID of the AI agent to delete") },
+    async (params) => {
+      const result = await grinfiRequest("DELETE", `/ai/api/agents/${params.uuid}`);
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "update_ai_template",
+    "Update an AI template by UUID. Lets you change name, prompt, body, subject, etc.",
+    {
+      uuid: z.string().describe("UUID of the AI template"),
+      name: z.string().optional(),
+      type: z.string().optional(),
+      prompt: z.string().optional(),
+      body: z.string().optional(),
+      subject: z.string().optional(),
+      fallback_body: z.string().optional(),
+      enable_validation: z.boolean().optional(),
+      template_category_uuid: z.string().optional(),
+    },
+    async (params) => {
+      const { uuid, ...fields } = params;
+      const body: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(fields)) { if (v !== undefined) body[k] = v; }
+      const result = await grinfiRequest("PUT", `/ai/api/templates/${uuid}`, body);
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "delete_ai_template",
+    "Delete an AI template by UUID.",
+    { uuid: z.string().describe("UUID of the AI template to delete") },
+    async (params) => {
+      const result = await grinfiRequest("DELETE", `/ai/api/templates/${params.uuid}`);
+      return jsonResult(result);
+    },
+  );
+
+  // ===========================
+  // CLOSURES (gaps in existing CRUD)
+  // ===========================
+
+  server.tool(
+    "upload_attachment",
+    "Upload a file as an attachment. Used for adding documents/images to contacts, automations, or LinkedIn/email messages. The file_path must be an absolute path on the local machine.",
+    {
+      file_path: z.string().describe("Absolute path to the file on the local machine"),
+      filename: z.string().optional().describe("Override the filename (defaults to the basename of file_path)"),
+    },
+    async (params) => {
+      const result = await grinfiUpload(
+        "/leads/api/attachments",
+        params.file_path,
+        "file",
+        params.filename,
+      );
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "remove_from_leads_blacklist",
+    "Remove a contact from the leads blacklist by UUID. Pairs with add_to_leads_blacklist.",
+    { uuid: z.string().describe("UUID of the blacklist entry to remove") },
+    async (params) => {
+      const result = await grinfiRequest("DELETE", `/leads/api/blacklist/leads/${params.uuid}`);
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "remove_from_companies_blacklist",
+    "Remove a company from the companies blacklist by UUID. Pairs with add_to_companies_blacklist.",
+    { uuid: z.string().describe("UUID of the blacklist entry to remove") },
+    async (params) => {
+      const result = await grinfiRequest("DELETE", `/leads/api/blacklist/companies/${params.uuid}`);
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "update_custom_field",
+    "Update a custom field's name or display order. To set a value on a contact/company, use upsert_custom_field_value instead.",
+    {
+      uuid: z.string().describe("UUID of the custom field"),
+      name: z.string().optional(),
+      order: z.number().optional(),
+    },
+    async (params) => {
+      const { uuid, ...fields } = params;
+      const body: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(fields)) { if (v !== undefined) body[k] = v; }
+      const result = await grinfiRequest("PUT", `/leads/api/custom-fields/${uuid}`, body);
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "delete_custom_field",
+    "Delete a custom field by UUID. This will remove the field and all its values from contacts/companies. Irreversible.",
+    { uuid: z.string().describe("UUID of the custom field to delete") },
+    async (params) => {
+      const result = await grinfiRequest("DELETE", `/leads/api/custom-fields/${params.uuid}`);
+      return jsonResult(result);
+    },
+  );
 
   // --- Multi-team tools (only registered when GRINFI_TEAM_KEYS is set) ---
 
