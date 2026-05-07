@@ -207,14 +207,14 @@ Visit **[mcp.grinfi.io](https://mcp.grinfi.io)** to generate your personal MCP e
 | `count_leads` | Count contacts matching a filter |
 | `get_leads_metrics` | Get team engagement metrics for contacts |
 
-### Automation Folders & Enrollment *(new in 1.1)*
+### Automation Folders & Enrollment
 
 | Tool | Description |
 |------|-------------|
-| `list_flow_workspaces` | List automation folders |
-| `create_flow_workspace` | Create a new automation folder |
-| `update_flow_workspace` | Rename or update a folder |
-| `delete_flow_workspace` | Delete a folder (automations inside are not deleted) |
+| `list_automation_folders` | List automation folders *(renamed from `list_flow_workspaces` in 1.2)* |
+| `create_automation_folder` | Create a new automation folder *(renamed in 1.2)* |
+| `update_automation_folder` | Rename or change display order *(renamed in 1.2)* |
+| `delete_automation_folder` | Delete a folder (automations inside are not deleted) *(renamed in 1.2)* |
 | `list_flow_leads` | Search contacts enrolled in automations |
 | `delete_flow_lead_history` | Delete a contact's automation history (full erase) |
 
@@ -237,6 +237,62 @@ Visit **[mcp.grinfi.io](https://mcp.grinfi.io)** to generate your personal MCP e
 | `remove_from_companies_blacklist` | Remove a company from the companies blacklist |
 | `update_custom_field` | Rename a custom field or change order |
 | `delete_custom_field` | Delete a custom field (and all its values) |
+
+### Failed-task triage *(new in 1.2)*
+
+| Tool | Description |
+|------|-------------|
+| `diagnose_failed_tasks` | Read-only triage: failure breakdown by error code, per-sender, sample tasks, pattern hints (captcha/proxy/rate-limit detection) |
+| `restart_failed_tasks` | Bulk-retry failed automation tasks (filter or explicit UUIDs); supports `dry_run` |
+| `skip_failed_tasks` | Bulk-skip failed tasks (lead progresses to next node) |
+| `restart_failed_tasks_from_top` | Re-enrol matched leads from the start of a flow; optionally swap to a different sender |
+
+### Workspace dashboard & health *(new in 1.2)*
+
+| Tool | Description |
+|------|-------------|
+| `workspace_health_check` | Single-call 6-section operational overview: today/yesterday counts, LinkedIn fleet, mailbox health, active flows, failed tasks |
+| `get_dashboard` | CRM analytics widgets: activities-over-time, conversion-funnel, pipeline-distribution, sender-performance, response-rate |
+| `send_volume_report` | Period-aware outreach event counts with flexible group_by (type, status, flow, sender, day, week) |
+| `diagnose_mailbox` | Deep mailbox health diagnosis with detected issues + recommendations |
+| `get_health_snapshots` | Fleet-wide LinkedIn account snapshot (status, cookie, health score, daily caps) |
+
+### LinkedIn browsers *(new in 1.2)*
+
+| Tool | Description |
+|------|-------------|
+| `list_linkedin_browsers` | List all LinkedIn browser profiles |
+| `get_linkedin_browser` | Get a browser by ID |
+| `create_linkedin_browser` | Create a browser linked to a sender profile |
+| `delete_linkedin_browser` | Delete a browser (irreversible) |
+| `run_linkedin_browser` / `stop_linkedin_browser` | Start / stop a browser session |
+| `set_linkedin_browser_proxy` | Change proxy country |
+| `share_linkedin_browser` | Share browser access with team members by email |
+| `diagnose_linkedin_browser` | Deep health diagnosis on one browser (cookie, health score, limits, proxy) |
+
+### Data sources (LinkedIn import jobs) *(new in 1.2)*
+
+| Tool | Description |
+|------|-------------|
+| `list_data_sources` / `get_data_source` | Discover & inspect import jobs |
+| `create_data_source` | Create import from CSV / Sales Navigator / LinkedIn search / post engagement |
+| `update_data_source` / `delete_data_source` | Edit or remove an import job |
+
+### Account & teams *(new in 1.2)*
+
+| Tool | Description |
+|------|-------------|
+| `get_current_user` | Authenticated user profile |
+| `list_teams` | All teams accessible via the Grinfi API (vs `list_my_teams` for locally-configured keys) |
+| `get_team` | Team details by numeric ID |
+
+### Integrations & diagnostics *(new in 1.2)*
+
+| Tool | Description |
+|------|-------------|
+| `call_external_api` | Ad-hoc outbound HTTP request (SSRF-protected, public URLs only, 1MB cap) |
+| `list_outbound_log` | Outbound HTTP log: webhook deliveries, automation API calls, enrichment requests |
+| `test_llm_connection` | Smoke-test a stored LLM integration (~5 token cost) |
 
 ---
 
