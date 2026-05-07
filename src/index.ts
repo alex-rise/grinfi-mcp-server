@@ -3349,6 +3349,35 @@ function createMcpServer(): McpServer {
     return jsonResult(result);
   });
 
+  // ===========================
+  // ACCOUNT (current user, teams)
+  // ===========================
+
+  server.tool("get_current_user", "Get the current authenticated user's profile and configuration.", {},
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async () => {
+    const result = await grinfiRequest("GET", "/id/api/users/current");
+    return jsonResult(result);
+  });
+
+  server.tool("list_teams", "List all teams (workspaces) available to the current user via the Grinfi API. Different from list_my_teams (which lists locally-configured team API keys). Use to discover team IDs.", {
+    limit: z.number().optional(), offset: z.number().optional(),
+  },
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async (params) => {
+    const result = await grinfiRequest("GET", "/id/api/teams", undefined, buildQuery(params));
+    return jsonResult(result);
+  });
+
+  server.tool("get_team", "Get details of a specific team by numeric ID.", {
+    id: z.number().describe("Team ID (integer, not UUID)"),
+  },
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async (params) => {
+    const result = await grinfiRequest("GET", `/id/api/teams/${params.id}`);
+    return jsonResult(result);
+  });
+
   // --- Multi-team tools (only registered when GRINFI_TEAM_KEYS is set) ---
 
   if (teamKeys.length > 0) {
