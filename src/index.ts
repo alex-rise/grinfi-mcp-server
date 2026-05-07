@@ -1942,66 +1942,50 @@ function createMcpServer(): McpServer {
   );
 
   // ===========================
-  // FLOW WORKSPACES (automation folders)
+  // AUTOMATION FOLDERS
   // ===========================
 
-  server.tool(
-    "list_flow_workspaces",
-    "List automation folders (flow workspaces). Used to organize automations into groups.",
-    {
-      limit: z.number().optional(), offset: z.number().optional(),
-      order_field: z.string().optional(), order_type: z.enum(["asc", "desc"]).optional(),
-      search: z.string().optional(),
-    },
-    async (params) => {
-      const result = await grinfiRequest("GET", "/flows/api/flow-workspaces", undefined, buildQuery(params));
-      return jsonResult(result);
-    },
-  );
+  server.tool("list_automation_folders", "List all automation folders (workspaces) for organizing automations.", {},
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async () => {
+    const result = await grinfiRequest("GET", "/flows/api/flow-workspaces");
+    return jsonResult(result);
+  });
 
-  server.tool(
-    "create_flow_workspace",
-    "Create a new automation folder.",
-    {
-      name: z.string().describe("Folder name"),
-      description: z.string().optional(),
-    },
+  server.tool("create_automation_folder", "Create a new automation folder.", {
+    name: z.string().describe("Name of the folder"),
+    order: z.number().optional().describe("Display order position"),
+  },
+    { readOnlyHint: false, destructiveHint: false },
     async (params) => {
-      const body: Record<string, unknown> = { name: params.name };
-      if (params.description) body.description = params.description;
-      const result = await grinfiRequest("POST", "/flows/api/flow-workspaces", body);
-      return jsonResult(result);
-    },
-  );
+    const body: Record<string, unknown> = { name: params.name };
+    if (params.order !== undefined) body.order = params.order;
+    const result = await grinfiRequest("POST", "/flows/api/flow-workspaces", body);
+    return jsonResult(result);
+  });
 
-  server.tool(
-    "update_flow_workspace",
-    "Rename or update an automation folder.",
-    {
-      uuid: z.string().describe("UUID of the flow workspace"),
-      name: z.string().optional(),
-      description: z.string().optional(),
-    },
+  server.tool("update_automation_folder", "Update an automation folder's name or display order.", {
+    uuid: z.string().describe("UUID of the automation folder"),
+    name: z.string().optional(),
+    order: z.number().optional(),
+  },
+    { readOnlyHint: false, destructiveHint: false },
     async (params) => {
-      const { uuid, ...fields } = params;
-      const body: Record<string, unknown> = {};
-      for (const [k, v] of Object.entries(fields)) { if (v !== undefined) body[k] = v; }
-      const result = await grinfiRequest("PUT", `/flows/api/flow-workspaces/${uuid}`, body);
-      return jsonResult(result);
-    },
-  );
+    const { uuid, ...fields } = params;
+    const body: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(fields)) { if (v !== undefined) body[k] = v; }
+    const result = await grinfiRequest("PUT", `/flows/api/flow-workspaces/${uuid}`, body);
+    return jsonResult(result);
+  });
 
-  server.tool(
-    "delete_flow_workspace",
-    "Delete an automation folder by UUID. Automations inside are not deleted, but become unfiled.",
-    {
-      uuid: z.string().describe("UUID of the flow workspace to delete"),
-    },
+  server.tool("delete_automation_folder", "Delete an automation folder by UUID.", {
+    uuid: z.string().describe("UUID of the automation folder to delete"),
+  },
+    { readOnlyHint: false, destructiveHint: true },
     async (params) => {
-      const result = await grinfiRequest("DELETE", `/flows/api/flow-workspaces/${params.uuid}`);
-      return jsonResult(result);
-    },
-  );
+    const result = await grinfiRequest("DELETE", `/flows/api/flow-workspaces/${params.uuid}`);
+    return jsonResult(result);
+  });
 
   server.tool(
     "list_flow_leads",
@@ -2186,6 +2170,1374 @@ function createMcpServer(): McpServer {
     async (params) => {
       const result = await grinfiRequest("DELETE", `/leads/api/custom-fields/${params.uuid}`);
       return jsonResult(result);
+    },
+  );
+
+  // ===========================
+  // FAILED-TASK TRIAGE — diagnose / restart / skip / restart-from-top
+  // ===========================
+
+  server.tool(
+    "diagnose_failed_tasks",
+    "Diagnose failed/canceled automation tasks across a flow / sender / period. Read-only. Returns failure breakdown by automation_error_code (replied / too_many_attempts / unknown), per-sender counts, sample task records (with first-line error_summary), and free-text pattern hints (captcha/proxy/rate-limit detection). Use BEFORE bulk_retry to confirm there is something retryable and to spot patterns that need a human (proxy down, account banned, etc.). Filter by period (24h/7d/30d), flow_uuid, sender_profile_uuid, status (failed/canceled/both). DOES NOT mutate state.",
+    {
+      flow_uuid: z.string().optional().describe("Optional flow UUID — scope diagnosis to one automation. Resolve via list_automations."),
+      sender_profile_uuid: z.string().optional().describe("Optional sender profile UUID — scope diagnosis to one sender. Resolve via list_sender_profiles."),
+      period: z.enum(["24h", "7d", "30d"]).optional().describe("Lookback window (default '24h'). Filters tasks by schedule_at >= now - period."),
+      limit: z.number().int().min(1).max(200).optional().describe("Max sample tasks to fetch for pattern hints + samples block (default 100, cap 200)."),
+      status: z.enum(["failed", "canceled", "both"]).optional().describe("Status of tasks to diagnose. 'failed' (default), 'canceled' (where 'replied' code typically appears), 'both' for combined view."),
+      verbose: z.boolean().optional().describe("If true, return full error_msg per sample (no truncation). Default false — error_msg trimmed to 500 chars; error_summary always provided as first-line digest."),
+      include_internal: z.boolean().optional().describe("If true, include internal task types (util_timer, trigger_*) in samples / by_sender / pattern_hints. Default false — internal types are noise that mask real outreach failures."),
+    },
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async (params) => {
+      const periodMs: Record<"24h" | "7d" | "30d", number> = {
+        "24h": 24 * 60 * 60 * 1000,
+        "7d": 7 * 24 * 60 * 60 * 1000,
+        "30d": 30 * 24 * 60 * 60 * 1000,
+      };
+      const period = params.period ?? "24h";
+      const since = new Date(Date.now() - periodMs[period]).toISOString();
+      const sampleLimit = params.limit ?? 100;
+      const verbose = params.verbose ?? false;
+      const includeInternal = params.include_internal ?? false;
+
+      const status = params.status ?? "failed";
+      const statusFilter: unknown = status === "both" ? ["failed", "canceled"] : status;
+
+      const filter: Record<string, unknown> = {
+        status: statusFilter,
+        schedule_at: { ">=": since },
+      };
+      if (params.flow_uuid) filter.flow_uuid = params.flow_uuid;
+      if (params.sender_profile_uuid) filter.sender_profile_uuid = params.sender_profile_uuid;
+
+      const internalTypes = ["util_timer", "trigger_message_replied", "trigger_completed", "trigger_paused"];
+      if (!includeInternal) {
+        filter.type = { "!=": internalTypes };
+      }
+
+      const [byErrorCode, bySender, samplesResult] = await Promise.all([
+        grinfiRequest("POST", "/flows/api/tasks/group-counts", { filter, group_field: "automation_error_code" }),
+        grinfiRequest("POST", "/flows/api/tasks/group-counts", { filter, group_field: "sender_profile_uuid" }),
+        grinfiRequest("POST", "/flows/api/tasks/list", { filter, limit: sampleLimit, order_field: "schedule_at", order_type: "desc" }),
+      ]);
+
+      function toCountArr(payload: unknown): { value: string; count: number }[] {
+        if (payload && typeof payload === "object") {
+          const obj = payload as Record<string, unknown>;
+          const dataField = obj.data;
+          if (Array.isArray(dataField)) return dataField as { value: string; count: number }[];
+          const arr: { value: string; count: number }[] = [];
+          for (const [k, v] of Object.entries(obj)) {
+            if (typeof v === "number") {
+              arr.push({ value: k === "" ? "unclassified" : k, count: v });
+            }
+          }
+          return arr;
+        }
+        return [];
+      }
+
+      const byErrCodeArr = toCountArr(byErrorCode);
+      const bySenderArr = toCountArr(bySender);
+
+      const senderUuids = bySenderArr.map((b) => b.value).filter((u): u is string => typeof u === "string" && u.length > 0 && u !== "unclassified");
+      const senderNames: Record<string, string> = {};
+      await Promise.all(
+        senderUuids.map(async (uuid) => {
+          try {
+            const r = await grinfiRequest("GET", `/flows/api/sender-profiles/${uuid}`) as { name?: string; email?: string };
+            senderNames[uuid] = r.name ?? r.email ?? uuid;
+          } catch {
+            senderNames[uuid] = uuid;
+          }
+        }),
+      );
+
+      const samplesArr = Array.isArray((samplesResult as { data?: unknown }).data)
+        ? ((samplesResult as { data: Record<string, unknown>[] }).data)
+        : [];
+      const flowUuids = Array.from(new Set(samplesArr.map((s) => s.flow_uuid as string).filter((u): u is string => typeof u === "string" && u.length > 0)));
+      const flowNames: Record<string, string> = {};
+      await Promise.all(
+        flowUuids.map(async (uuid) => {
+          try {
+            const r = await grinfiRequest("GET", `/flows/api/flows/${uuid}`) as { name?: string };
+            flowNames[uuid] = r.name ?? uuid;
+          } catch {
+            flowNames[uuid] = uuid;
+          }
+        }),
+      );
+
+      function firstLine(s: string): string {
+        const i = s.indexOf("\n");
+        return i === -1 ? s : s.slice(0, i);
+      }
+
+      const samples = samplesArr.map((t) => {
+        const errorMsgRaw = typeof t.error_msg === "string" ? t.error_msg : "";
+        const errorSummary = errorMsgRaw ? firstLine(errorMsgRaw).slice(0, 200) : "";
+        const errorMsg = verbose ? errorMsgRaw : (errorMsgRaw.length > 500 ? errorMsgRaw.slice(0, 500) + "…" : errorMsgRaw);
+        const senderUuid = t.sender_profile_uuid as string | undefined;
+        const flowUuid = t.flow_uuid as string | undefined;
+        return {
+          uuid: t.uuid,
+          type: t.type,
+          status: t.status,
+          automation_error_code: t.automation_error_code ?? null,
+          schedule_at: t.schedule_at,
+          flow_uuid: flowUuid,
+          flow_name: flowUuid ? flowNames[flowUuid] : undefined,
+          sender_profile_uuid: senderUuid,
+          sender_name: senderUuid ? senderNames[senderUuid] : undefined,
+          lead_uuid: t.lead_uuid,
+          attempts: t.attempts,
+          error_summary: errorSummary,
+          error_msg: errorMsg,
+        };
+      });
+
+      const patternHints: string[] = [];
+      const allErrors = samples.map((s) => (s.error_msg ?? "").toLowerCase()).join(" ");
+      if (/captcha|recaptcha|verify\s+you/.test(allErrors)) {
+        patternHints.push("CAPTCHA detected — at least one sender hit a LinkedIn challenge. Manual cookie refresh likely needed.");
+      }
+      if (/proxy|connection\s+refused|connect\s+timeout|connect\s+to\s+server|couldn'?t\s+connect|failed\s+to\s+connect|enotfound|econnrefused|etimedout|curl\s+error\s+7|curl\s+error\s+28/.test(allErrors)) {
+        patternHints.push("Proxy/network connectivity issues detected (cURL connect errors, refused connections). Check sender proxy via diagnose_linkedin_browser or replace_proxy.");
+      }
+      if (/rate\s*limit|429|too\s+many\s+requests/.test(allErrors)) {
+        patternHints.push("Rate-limit signals detected — back off, reduce daily caps, or wait for cooldown before retry.");
+      }
+      if (/banned|suspended|account\s+restricted|account\s+is\s+disabled/.test(allErrors)) {
+        patternHints.push("Account ban/suspension detected — DO NOT retry. Investigate sender account state manually.");
+      }
+      if (/unauthorized|401|cookie\s+expired|session\s+expired|jwt.*expired/.test(allErrors)) {
+        patternHints.push("Auth/cookie issues detected — sender's LinkedIn session likely expired. Refresh cookies via cloud browser.");
+      }
+      if (/timeout\b|timed\s*out/.test(allErrors)) {
+        patternHints.push("Timeout errors detected — backend or LinkedIn response slow. Could be transient (safe to retry) or proxy slowness (investigate).");
+      }
+      if (byErrCodeArr.find((b) => b.value === "replied" && b.count > 0)) {
+        patternHints.push("Some tasks have automation_error_code='replied' — these are leads that responded. NEVER retry replied tasks. The bulk_retry tool already excludes them.");
+      }
+      if (byErrCodeArr.find((b) => b.value === "unclassified" && b.count > 0)) {
+        patternHints.push("Some failures are unclassified by backend (null automation_error_code). The error_msg samples below may reveal patterns. Use include_unclassified=true with restart_failed_tasks to retry these.");
+      }
+
+      const bySenderEnriched = bySenderArr.map((b) => ({
+        sender_profile_uuid: b.value,
+        sender_name: senderNames[b.value] ?? b.value,
+        count: b.count,
+      }));
+
+      return jsonResult({
+        period,
+        status,
+        scope: {
+          flow_uuid: params.flow_uuid ?? null,
+          sender_profile_uuid: params.sender_profile_uuid ?? null,
+          since,
+          include_internal: includeInternal,
+        },
+        by_error_code: byErrCodeArr,
+        by_sender: bySenderEnriched,
+        samples,
+        pattern_hints: patternHints,
+        samples_count: samples.length,
+      });
+    },
+  );
+
+  // Shared filter builder for restart/skip/restart-from-top
+  function buildTaskTriageFilter(p: {
+    flow_uuid?: string;
+    sender_profile_uuid?: string;
+    period?: "24h" | "7d" | "30d";
+    automation_error_code?: string;
+    include_unclassified?: boolean;
+    task_uuids?: string[];
+  }): Record<string, unknown> {
+    const periodMs: Record<string, number> = {
+      "24h": 24 * 60 * 60 * 1000,
+      "7d": 7 * 24 * 60 * 60 * 1000,
+      "30d": 30 * 24 * 60 * 60 * 1000,
+    };
+    const period = p.period ?? "24h";
+    const since = new Date(Date.now() - periodMs[period]).toISOString();
+    const filter: Record<string, unknown> = {
+      status: "failed",
+      schedule_at: { ">=": since },
+    };
+    if (p.flow_uuid) filter.flow_uuid = p.flow_uuid;
+    if (p.sender_profile_uuid) filter.sender_profile_uuid = p.sender_profile_uuid;
+    if (p.automation_error_code) {
+      filter.automation_error_code = p.automation_error_code;
+    } else if (!(p.include_unclassified ?? false)) {
+      filter.automation_error_code = ["too_many_attempts", "unknown"];
+    }
+    if (p.task_uuids && p.task_uuids.length > 0) {
+      filter.id = p.task_uuids;
+    }
+    return filter;
+  }
+
+  server.tool(
+    "restart_failed_tasks",
+    "Bulk-retry failed automation tasks using a filter (or explicit task UUIDs). Re-queues matching tasks to run again from where they failed; status: failed → restarted → in_progress. Hard-coded skip: 'replied' (lead has responded — never retry). Use diagnose_failed_tasks FIRST to confirm there's something retryable. Pass dry_run:true to preview matched_count without mutation. include_unclassified:true catches NULL automation_error_code (workaround for backend classifier gap).",
+    {
+      flow_uuid: z.string().optional().describe("Scope to one automation"),
+      sender_profile_uuid: z.string().optional().describe("Scope to one sender"),
+      period: z.enum(["24h", "7d", "30d"]).optional().describe("Lookback window (default 24h)"),
+      automation_error_code: z.enum(["too_many_attempts", "unknown", "replied"]).optional().describe("Filter to specific error code"),
+      include_unclassified: z.boolean().optional().describe("If true, catch tasks with NULL automation_error_code. Workaround for backend gap. Safe — status:'failed' alone never includes 'replied' tasks (those are canceled). Default false."),
+      task_uuids: z.array(z.string()).optional().describe("Explicit task UUIDs to retry. Overrides filter."),
+      dry_run: z.boolean().optional().describe("If true, only count what would be retried — no mutation."),
+    },
+    { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
+    async (params) => {
+      const filter = buildTaskTriageFilter(params);
+
+      if (params.dry_run) {
+        try {
+          const counts = await grinfiRequest("POST", "/flows/api/tasks/group-counts", {
+            filter,
+            group_field: "type",
+          }) as Record<string, unknown>;
+          let total = 0;
+          for (const v of Object.values(counts)) {
+            if (typeof v === "number") total += v;
+          }
+          return jsonResult({
+            dry_run: true,
+            matched_count: total,
+            filter,
+            note: "No mutation performed. Run without dry_run to actually retry.",
+          });
+        } catch (err) {
+          return jsonResult({
+            dry_run: true,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+
+      const result = await grinfiRequest("PUT", "/flows/api/tasks/mass-retry", { filter });
+      return jsonResult({ result, filter });
+    },
+  );
+
+  server.tool(
+    "skip_failed_tasks",
+    "Bulk-skip failed automation tasks: lead PROGRESSES to next node without re-executing the failed step (status: failed → skipped). Use when failure isn't worth retrying (data quality issue, optional webhook node, etc.) and you just want the lead to continue. UI equivalent: 'Skip' button on failed-task modal. ⚠ STATE MUTATION — leads progress through their flow. Pair with diagnose_failed_tasks first; pass dry_run:true to preview.",
+    {
+      flow_uuid: z.string().optional(),
+      sender_profile_uuid: z.string().optional(),
+      period: z.enum(["24h", "7d", "30d"]).optional(),
+      automation_error_code: z.enum(["too_many_attempts", "unknown", "replied"]).optional(),
+      include_unclassified: z.boolean().optional(),
+      task_uuids: z.array(z.string()).optional().describe("Explicit task UUIDs to skip"),
+      dry_run: z.boolean().optional(),
+    },
+    { readOnlyHint: false, destructiveHint: true, idempotentHint: false },
+    async (params) => {
+      const filter = buildTaskTriageFilter(params);
+      if (params.dry_run) {
+        try {
+          const counts = await grinfiRequest("POST", "/flows/api/tasks/group-counts", { filter, group_field: "type" }) as Record<string, unknown>;
+          let total = 0;
+          for (const v of Object.values(counts)) if (typeof v === "number") total += v;
+          return jsonResult({ dry_run: true, matched_count: total, filter, note: "No mutation. Run without dry_run to actually skip." });
+        } catch (err) {
+          return jsonResult({ dry_run: true, error: err instanceof Error ? err.message : String(err) });
+        }
+      }
+      const result = await grinfiRequest("PUT", "/flows/api/tasks/mass-skip", { filter });
+      return jsonResult({ result, filter });
+    },
+  );
+
+  server.tool(
+    "restart_failed_tasks_from_top",
+    "Re-enrol matched leads from the START of a flow (node 1), bypassing the failed task position. Optionally swap to a different sender via new_sender_profile_uuid. UI equivalent: 'Restart from top' on failed-task modal. ⚠ MAJOR STATE MUTATION — leads will receive initial flow messages again (including connection requests/initial emails). Treat as fresh enrolment. ALWAYS use dry_run:true first; ALWAYS confirm with user before running for-real.",
+    {
+      flow_uuid: z.string().describe("Flow UUID to restart leads in (REQUIRED)"),
+      sender_profile_uuid: z.string().optional().describe("Optional: scope to leads currently on this sender"),
+      period: z.enum(["24h", "7d", "30d"]).optional(),
+      automation_error_code: z.enum(["too_many_attempts", "unknown", "replied"]).optional(),
+      include_unclassified: z.boolean().optional(),
+      new_sender_profile_uuid: z.string().optional().describe("If provided, leads restart on this sender instead of their original."),
+      dry_run: z.boolean().optional(),
+    },
+    { readOnlyHint: false, destructiveHint: true, idempotentHint: false },
+    async (params) => {
+      const filter = buildTaskTriageFilter({
+        flow_uuid: params.flow_uuid,
+        sender_profile_uuid: params.sender_profile_uuid,
+        period: params.period,
+        automation_error_code: params.automation_error_code,
+        include_unclassified: params.include_unclassified,
+      });
+      if (params.dry_run) {
+        try {
+          const counts = await grinfiRequest("POST", "/flows/api/tasks/group-counts", { filter, group_field: "type" }) as Record<string, unknown>;
+          let total = 0;
+          for (const v of Object.values(counts)) if (typeof v === "number") total += v;
+          return jsonResult({
+            dry_run: true,
+            matched_count: total,
+            filter,
+            warning: "Each matched lead will receive initial flow messages AGAIN. Treat as fresh enrolment.",
+          });
+        } catch (err) {
+          return jsonResult({ dry_run: true, error: err instanceof Error ? err.message : String(err) });
+        }
+      }
+      const body: Record<string, unknown> = {
+        filter,
+        flow_uuid: params.flow_uuid,
+        flow_origin: "automation",
+        new_contact_source_id: 1,
+      };
+      if (params.new_sender_profile_uuid) body.sender_profile_uuid = params.new_sender_profile_uuid;
+      const result = await grinfiRequest("PUT", "/flows/api/tasks/mass-restart-from-top", body);
+      return jsonResult({ result, body });
+    },
+  );
+
+  // ===========================
+  // WORKSPACE HEALTH CHECK & DASHBOARD
+  // ===========================
+
+  server.tool(
+    "workspace_health_check",
+    "Single-call workspace dashboard — operational overview in one tool call. Returns 6 sections: 1) today (sends/replies counts per type), 2) yesterday (same shape), 3) linkedin_health (browser fleet status, cookies, daily caps), 4) email_health (mailboxes status + errors), 5) active_flows (running automations with in-progress task counts), 6) failed_tasks (failed counts today/yesterday/7d by task type). All sections fetched in parallel for speed. Pass dry_run:true to drop detail rows and only return aggregated counters.",
+    {
+      dry_run: z.boolean().optional().describe("If true, return only summary counters (no per-browser/per-mailbox/per-flow detail rows)"),
+    },
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async (params) => {
+      const dry = params.dry_run ?? false;
+      const now = Date.now();
+      const todayStart = new Date(now);
+      todayStart.setUTCHours(0, 0, 0, 0);
+      const yesterdayStart = new Date(todayStart.getTime() - 24 * 60 * 60 * 1000);
+      const sevenDaysAgo = new Date(now - 7 * 24 * 60 * 60 * 1000);
+
+      const todayIso = todayStart.toISOString();
+      const yesterdayIso = yesterdayStart.toISOString();
+      const sevenDaysAgoIso = sevenDaysAgo.toISOString();
+
+      const internalTypes = ["util_timer", "trigger_message_replied", "trigger_completed", "trigger_paused"];
+
+      async function fetchCounts(filter: Record<string, unknown>, groupField: string): Promise<{ value: string; count: number }[]> {
+        try {
+          const res = await grinfiRequest("POST", "/flows/api/tasks/group-counts", { filter, group_field: groupField }) as Record<string, unknown>;
+          const arr: { value: string; count: number }[] = [];
+          for (const [k, v] of Object.entries(res)) {
+            if (typeof v === "number") arr.push({ value: k === "" ? "(unset)" : k, count: v });
+          }
+          if (arr.length === 0 && Array.isArray(res.data)) {
+            return (res.data as { value: string; count: number }[]);
+          }
+          return arr;
+        } catch {
+          return [];
+        }
+      }
+
+      const [
+        todayCompletedByType,
+        yesterdayCompletedByType,
+        browsersResult,
+        mailboxesResult,
+        flowsResult,
+        failedToday,
+        failedYesterday,
+        failed7d,
+      ] = await Promise.all([
+        fetchCounts({
+          status: "closed",
+          schedule_at: { ">=": todayIso },
+          type: { "!=": internalTypes },
+        }, "type"),
+        fetchCounts({
+          status: "closed",
+          schedule_at: { ">=": yesterdayIso, "<": todayIso },
+          type: { "!=": internalTypes },
+        }, "type"),
+        grinfiRequest("POST", "/browsers/api/linkedin-browsers/list", { limit: 100, offset: 0 }).catch(() => ({ data: [] })),
+        grinfiRequest("GET", "/emails/api/mailboxes", undefined, { limit: "100" }).catch(() => ({ data: [] })),
+        grinfiRequest("POST", "/flows/api/flows/list", { limit: 100, offset: 0, filter: { status: "in_progress" } }).catch(() => ({ data: [] })),
+        fetchCounts({
+          status: "failed",
+          schedule_at: { ">=": todayIso },
+          type: { "!=": internalTypes },
+        }, "type"),
+        fetchCounts({
+          status: "failed",
+          schedule_at: { ">=": yesterdayIso, "<": todayIso },
+          type: { "!=": internalTypes },
+        }, "type"),
+        fetchCounts({
+          status: "failed",
+          schedule_at: { ">=": sevenDaysAgoIso },
+          type: { "!=": internalTypes },
+        }, "type"),
+      ]);
+
+      function aggregateActivity(byType: { value: string; count: number }[]): Record<string, number> {
+        const agg: Record<string, number> = {
+          messages_sent: 0,
+          connect_requests_sent: 0,
+          inmails_sent: 0,
+          emails_sent: 0,
+          tasks_completed_total: 0,
+        };
+        for (const e of byType) {
+          agg.tasks_completed_total += e.count;
+          if (e.value === "linkedin_send_message") agg.messages_sent += e.count;
+          else if (e.value === "linkedin_send_connection_request") agg.connect_requests_sent += e.count;
+          else if (e.value === "linkedin_send_inmail") agg.inmails_sent += e.count;
+          else if (e.value === "gs_send_email") agg.emails_sent += e.count;
+        }
+        return agg;
+      }
+
+      const today = aggregateActivity(todayCompletedByType);
+      const yesterday = aggregateActivity(yesterdayCompletedByType);
+
+      const browsers = Array.isArray((browsersResult as { data?: unknown }).data) ? (browsersResult as { data: Record<string, unknown>[] }).data : [];
+      const linkedinHealth = {
+        total_browsers: browsers.length,
+        active: browsers.filter((b) => b.status === "active").length,
+        paused: browsers.filter((b) => b.status === "paused").length,
+        banned: browsers.filter((b) => b.status === "banned").length,
+        cookie_expired: browsers.filter((b) => b.cookie_status === "expired" || b.cookie_status === "invalid").length,
+        capacity_remaining: browsers.reduce((sum, b) => sum + Math.max(0, ((b.daily_limit as number) ?? 0) - ((b.usage_today as number) ?? 0)), 0),
+        details: dry ? null : browsers.map((b) => ({
+          id: b.id,
+          name: b.name ?? b.email ?? null,
+          status: b.status,
+          cookie_status: b.cookie_status,
+          health_score: b.health_score,
+          remaining_today: Math.max(0, ((b.daily_limit as number) ?? 0) - ((b.usage_today as number) ?? 0)),
+        })),
+      };
+
+      const mailboxes = Array.isArray((mailboxesResult as { data?: unknown }).data) ? (mailboxesResult as { data: Record<string, unknown>[] }).data : [];
+      const emailHealth = {
+        total_mailboxes: mailboxes.length,
+        active: mailboxes.filter((m) => m.send_status === "active").length,
+        sync_errors: mailboxes.filter((m) => ((m.sync_errors_count as number) ?? 0) > 0).length,
+        send_errors: mailboxes.filter((m) => ((m.send_errors_count as number) ?? 0) > 0).length,
+        details: dry ? null : mailboxes.map((m) => ({
+          uuid: m.uuid,
+          email: m.email,
+          send_status: m.send_status,
+          sync_status: m.sync_status,
+          send_errors_count: m.send_errors_count,
+          sync_errors_count: m.sync_errors_count,
+          last_send_at: m.last_send_at,
+        })),
+      };
+
+      const flows = Array.isArray((flowsResult as { data?: unknown }).data) ? (flowsResult as { data: Record<string, unknown>[] }).data : [];
+      const activeFlows = {
+        total: flows.length,
+        details: dry ? null : flows.map((f) => ({
+          uuid: f.uuid,
+          name: f.name,
+          status: f.status,
+          created_at: f.created_at,
+        })),
+      };
+
+      const failedSummary = {
+        today_total: failedToday.reduce((s, e) => s + e.count, 0),
+        yesterday_total: failedYesterday.reduce((s, e) => s + e.count, 0),
+        last_7d_total: failed7d.reduce((s, e) => s + e.count, 0),
+        last_7d_by_type: dry ? null : failed7d.sort((a, b) => b.count - a.count).slice(0, 10),
+      };
+
+      return jsonResult({
+        timestamp: new Date().toISOString(),
+        today,
+        yesterday,
+        linkedin_health: linkedinHealth,
+        email_health: emailHealth,
+        active_flows: activeFlows,
+        failed_tasks: failedSummary,
+      });
+    },
+  );
+
+  server.tool(
+    "get_dashboard",
+    "Fetch a CRM analytics widget (composite from existing metrics endpoints). Supported widget_type values: activities_over_time (sends/replies per day or week), conversion_funnel (lead counts per pipeline stage), pipeline_distribution (same as funnel but as percentages), sender_performance (per-sender event totals), response_rate (replies / sent ratio per sender or overall). Use for dashboard/report/summary questions. Use search_contacts for row-level data.",
+    {
+      widget_type: z.enum(["activities_over_time", "pipeline_distribution", "conversion_funnel", "sender_performance", "response_rate"]).describe("Widget type"),
+      period_from: z.string().optional().describe("Start date ISO (default: 30 days ago)"),
+      period_to: z.string().optional().describe("End date ISO (default: now)"),
+      flow_uuids: z.array(z.string()).optional().describe("Filter by flows"),
+      sender_profile_uuids: z.array(z.string()).optional().describe("Filter by senders"),
+      granularity: z.enum(["day", "week", "month"]).optional().describe("Time granularity (for activities_over_time). Default: day"),
+    },
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async (params) => {
+      const periodTo = params.period_to ?? new Date().toISOString();
+      const periodFrom = params.period_from ?? new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+
+      const baseFilter: Record<string, unknown> = {
+        schedule_at: { ">=": periodFrom, "<=": periodTo },
+      };
+      if (params.flow_uuids && params.flow_uuids.length > 0) baseFilter.flow_uuid = params.flow_uuids;
+      if (params.sender_profile_uuids && params.sender_profile_uuids.length > 0) baseFilter.sender_profile_uuid = params.sender_profile_uuids;
+
+      const internalTypes = ["util_timer", "trigger_message_replied", "trigger_completed", "trigger_paused"];
+      baseFilter.type = { "!=": internalTypes };
+
+      async function fetchCounts(filter: Record<string, unknown>, groupField: string): Promise<{ value: string; count: number }[]> {
+        try {
+          const res = await grinfiRequest("POST", "/flows/api/tasks/group-counts", { filter, group_field: groupField }) as Record<string, unknown>;
+          const arr: { value: string; count: number }[] = [];
+          for (const [k, v] of Object.entries(res)) {
+            if (typeof v === "number") arr.push({ value: k === "" ? "(unset)" : k, count: v });
+          }
+          return arr;
+        } catch {
+          return [];
+        }
+      }
+
+      switch (params.widget_type) {
+        case "activities_over_time": {
+          const granularity = params.granularity ?? "day";
+          const filter = { ...baseFilter, status: "closed" };
+          const buckets = await fetchCounts(filter, granularity);
+          const sortedBuckets = buckets.sort((a, b) => a.value.localeCompare(b.value));
+          return jsonResult({
+            widget: "activities_over_time",
+            period_from: periodFrom,
+            period_to: periodTo,
+            granularity,
+            total: sortedBuckets.reduce((s, b) => s + b.count, 0),
+            series: sortedBuckets.map((b) => ({ date: b.value, count: b.count })),
+          });
+        }
+
+        case "pipeline_distribution":
+        case "conversion_funnel": {
+          const stages = await grinfiRequest("GET", "/leads/api/pipeline-stages") as { data?: Record<string, unknown>[] };
+          const stageList = Array.isArray(stages.data) ? stages.data : [];
+          const leadStages = stageList.filter((s) => s.object_type === "lead").sort((a, b) => ((a.order as number) ?? 0) - ((b.order as number) ?? 0));
+
+          const counts = await Promise.all(
+            leadStages.map(async (stage) => {
+              try {
+                const r = await grinfiRequest("POST", "/leads/api/leads/count", { filter: { pipeline_stage_uuid: stage.uuid } }) as Record<string, unknown>;
+                const count = (r.count as number | undefined) ?? (r.total as number | undefined) ?? 0;
+                return { stage_uuid: stage.uuid as string, name: stage.name as string, category: stage.category as string, order: stage.order as number, count };
+              } catch {
+                return { stage_uuid: stage.uuid as string, name: stage.name as string, category: stage.category as string, order: stage.order as number, count: 0 };
+              }
+            }),
+          );
+
+          const total = counts.reduce((s, c) => s + c.count, 0);
+
+          if (params.widget_type === "pipeline_distribution") {
+            return jsonResult({
+              widget: "pipeline_distribution",
+              total,
+              stages: counts.map((c) => ({
+                ...c,
+                pct: total > 0 ? Math.round((c.count / total) * 1000) / 10 : 0,
+              })),
+            });
+          } else {
+            const stagesWithConv = counts.map((c, i) => {
+              const prev = i > 0 ? counts[i - 1].count : 0;
+              const conversionPctFromPrev = i > 0 && prev > 0 ? Math.round((c.count / prev) * 1000) / 10 : null;
+              return { ...c, conversion_pct_from_prev: conversionPctFromPrev };
+            });
+            return jsonResult({
+              widget: "conversion_funnel",
+              total_leads: total,
+              stages: stagesWithConv,
+            });
+          }
+        }
+
+        case "sender_performance": {
+          const filter = { ...baseFilter, status: "closed" };
+          const bySender = await fetchCounts(filter, "sender_profile_uuid");
+          const senderInfo: Record<string, string> = {};
+          await Promise.all(
+            bySender.map(async (s) => {
+              try {
+                const r = await grinfiRequest("GET", `/flows/api/sender-profiles/${s.value}`) as { name?: string; email?: string };
+                senderInfo[s.value] = r.name ?? r.email ?? s.value;
+              } catch {
+                senderInfo[s.value] = s.value;
+              }
+            }),
+          );
+          const sorted = bySender.sort((a, b) => b.count - a.count);
+          const total = sorted.reduce((s, e) => s + e.count, 0);
+          return jsonResult({
+            widget: "sender_performance",
+            period_from: periodFrom,
+            period_to: periodTo,
+            total,
+            senders: sorted.map((s) => ({
+              sender_profile_uuid: s.value,
+              sender_name: senderInfo[s.value] ?? s.value,
+              count: s.count,
+              pct: total > 0 ? Math.round((s.count / total) * 1000) / 10 : 0,
+            })),
+          });
+        }
+
+        case "response_rate": {
+          const sentFilter = {
+            ...baseFilter,
+            status: "closed",
+            type: ["linkedin_send_message", "linkedin_send_connection_request", "linkedin_send_inmail", "gs_send_email"],
+          };
+          const repliedFilter = {
+            ...baseFilter,
+            status: "canceled",
+            automation_error_code: "replied",
+          };
+          const [sentBySender, repliedBySender] = await Promise.all([
+            fetchCounts(sentFilter, "sender_profile_uuid"),
+            fetchCounts(repliedFilter, "sender_profile_uuid"),
+          ]);
+          const sentMap = new Map(sentBySender.map((s) => [s.value, s.count]));
+          const repliedMap = new Map(repliedBySender.map((s) => [s.value, s.count]));
+          const allSenders = Array.from(new Set([...sentMap.keys(), ...repliedMap.keys()]));
+
+          const senderInfo: Record<string, string> = {};
+          await Promise.all(
+            allSenders.map(async (uuid) => {
+              try {
+                const r = await grinfiRequest("GET", `/flows/api/sender-profiles/${uuid}`) as { name?: string; email?: string };
+                senderInfo[uuid] = r.name ?? r.email ?? uuid;
+              } catch {
+                senderInfo[uuid] = uuid;
+              }
+            }),
+          );
+
+          const senders = allSenders.map((uuid) => {
+            const sent = sentMap.get(uuid) ?? 0;
+            const replied = repliedMap.get(uuid) ?? 0;
+            const rate = sent > 0 ? Math.round((replied / sent) * 1000) / 10 : 0;
+            return { sender_profile_uuid: uuid, sender_name: senderInfo[uuid] ?? uuid, sent, replied, response_rate_pct: rate };
+          }).sort((a, b) => b.response_rate_pct - a.response_rate_pct);
+
+          const totalSent = senders.reduce((s, e) => s + e.sent, 0);
+          const totalReplied = senders.reduce((s, e) => s + e.replied, 0);
+          return jsonResult({
+            widget: "response_rate",
+            period_from: periodFrom,
+            period_to: periodTo,
+            overall: {
+              sent: totalSent,
+              replied: totalReplied,
+              response_rate_pct: totalSent > 0 ? Math.round((totalReplied / totalSent) * 1000) / 10 : 0,
+            },
+            by_sender: senders,
+          });
+        }
+
+        default: {
+          return jsonResult({ error: `Unknown widget_type: ${params.widget_type}` });
+        }
+      }
+    },
+  );
+
+  server.tool(
+    "send_volume_report",
+    "Count outreach EVENTS (tasks) over a period with flexible group_by. Use cases: 'how many messages sent last week?', 'connect requests per sender', 'sends per day per flow'. DIFFERS from workspace_health_check (which is operational today/yesterday): this is period-aware reporting with group_by flexibility. When group_by='type', task type names are remapped to user-friendly form (linkedin_send_message → messages_sent, linkedin_send_connection_request → connect_requests_sent, gs_send_email → emails_sent). Internal types (util_timer, trigger_*) excluded by default. Each entry includes pct_of_total.",
+    {
+      period: z.enum(["24h", "7d", "30d", "90d"]).optional().describe("Lookback window (default '7d')"),
+      group_by: z.enum(["type", "status", "flow_uuid", "sender_profile_uuid", "mailbox_uuid", "day", "week"]).optional().describe("Grouping field (default 'type')"),
+      flow_uuid: z.string().optional().describe("Optional: scope to one automation"),
+      sender_profile_uuid: z.string().optional().describe("Optional: scope to one sender"),
+      include_internal: z.boolean().optional().describe("Include util_timer/trigger_* task types (default false)"),
+      status: z.enum(["closed", "failed", "canceled", "in_progress", "all"]).optional().describe("Task status filter (default 'closed' = completed events)"),
+    },
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async (params) => {
+      const periodMs: Record<string, number> = {
+        "24h": 24 * 60 * 60 * 1000,
+        "7d": 7 * 24 * 60 * 60 * 1000,
+        "30d": 30 * 24 * 60 * 60 * 1000,
+        "90d": 90 * 24 * 60 * 60 * 1000,
+      };
+      const period = params.period ?? "7d";
+      const since = new Date(Date.now() - periodMs[period]).toISOString();
+      const groupBy = params.group_by ?? "type";
+
+      const filter: Record<string, unknown> = {
+        schedule_at: { ">=": since },
+      };
+      if (params.status && params.status !== "all") {
+        filter.status = params.status;
+      } else if (!params.status) {
+        filter.status = "closed";
+      }
+      if (params.flow_uuid) filter.flow_uuid = params.flow_uuid;
+      if (params.sender_profile_uuid) filter.sender_profile_uuid = params.sender_profile_uuid;
+
+      const internalTypes = ["util_timer", "trigger_message_replied", "trigger_completed", "trigger_paused"];
+      if (!(params.include_internal ?? false)) {
+        filter.type = { "!=": internalTypes };
+      }
+
+      const groupCounts = await grinfiRequest("POST", "/flows/api/tasks/group-counts", {
+        filter,
+        group_field: groupBy,
+      }) as Record<string, unknown>;
+
+      const entries: { value: string; count: number }[] = [];
+      for (const [k, v] of Object.entries(groupCounts)) {
+        if (typeof v === "number") {
+          entries.push({ value: k === "" ? "(unset)" : k, count: v });
+        }
+      }
+      if (entries.length === 0 && Array.isArray((groupCounts as { data?: unknown }).data)) {
+        const arr = (groupCounts as { data: { value: string; count: number }[] }).data;
+        entries.push(...arr);
+      }
+
+      const total = entries.reduce((sum, e) => sum + e.count, 0);
+
+      const typeFriendlyNames: Record<string, string> = {
+        linkedin_send_message: "messages_sent",
+        linkedin_send_connection_request: "connect_requests_sent",
+        linkedin_send_inmail: "inmails_sent",
+        linkedin_view_profile: "profile_views",
+        linkedin_send_post_engagement: "post_engagements",
+        gs_send_email: "emails_sent",
+        gs_add_tag: "tags_assigned",
+        gs_remove_tag: "tags_removed",
+        gs_change_pipeline_stage: "pipeline_stage_changes",
+        gs_add_to_list: "list_additions",
+        gs_run_ai_agent: "ai_agent_runs",
+        gs_phone_call: "phone_calls",
+        gs_custom_action: "custom_actions",
+      };
+
+      const enriched = entries
+        .sort((a, b) => b.count - a.count)
+        .map((e) => {
+          const friendlyKey = groupBy === "type" ? (typeFriendlyNames[e.value] ?? e.value) : e.value;
+          return {
+            key: friendlyKey,
+            raw_key: e.value,
+            count: e.count,
+            pct_of_total: total > 0 ? Math.round((e.count / total) * 1000) / 10 : 0,
+          };
+        });
+
+      return jsonResult({
+        period,
+        since,
+        group_by: groupBy,
+        scope: {
+          flow_uuid: params.flow_uuid ?? null,
+          sender_profile_uuid: params.sender_profile_uuid ?? null,
+          status: filter.status,
+          include_internal: params.include_internal ?? false,
+        },
+        total,
+        groups: enriched,
+      });
+    },
+  );
+
+  server.tool(
+    "diagnose_mailbox",
+    "Run a deep health diagnosis on a single mailbox by UUID. Returns send/sync status, connection settings (host:port masked-password), proxy info, error counts, last activity timestamps, automation daily_limit + interval, plus a list of detected issues (send_status=error, sync_errors over threshold, no activity for 24h+, etc.) and recommendations. Use to investigate why a mailbox is failing; for the listing of all mailboxes use list_mailboxes, for raw error list use list_mailbox_errors.",
+    {
+      uuid: z.string().describe("UUID of the mailbox to diagnose"),
+    },
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async (params) => {
+      const mailbox = await grinfiRequest("GET", `/emails/api/mailboxes/${params.uuid}`) as Record<string, unknown>;
+      const cs = mailbox.connection_settings as Record<string, Record<string, unknown>> | undefined;
+      const masked = cs ? {
+        send: cs.send ? { ...cs.send, password: cs.send.password ? "***MASKED***" : null } : null,
+        sync: cs.sync ? { ...cs.sync, password: cs.sync.password ? "***MASKED***" : null } : null,
+      } : null;
+      const proxy = mailbox.proxy_settings as Record<string, unknown> | null | undefined;
+      const maskedProxy = proxy ? { ...proxy, password: proxy.password ? "***MASKED***" : null } : null;
+
+      const sendStatus = mailbox.send_status as string;
+      const syncStatus = mailbox.sync_status as string;
+      const sendErrors = (mailbox.send_errors_count as number | undefined) ?? 0;
+      const syncErrors = (mailbox.sync_errors_count as number | undefined) ?? 0;
+      const lastSendAt = mailbox.last_send_at as string | null | undefined;
+      const lastSyncAt = mailbox.last_sync_at as string | null | undefined;
+
+      const issues: string[] = [];
+      const recommendations: string[] = [];
+
+      if (sendStatus !== "active") {
+        issues.push(`send_status is '${sendStatus}' (expected 'active')`);
+        recommendations.push("Use update_mailbox to fix or activate_mailbox to re-enable.");
+      }
+      if (syncStatus !== "active") {
+        issues.push(`sync_status is '${syncStatus}' (expected 'active')`);
+      }
+      if (sendErrors > 5) {
+        issues.push(`${sendErrors} send errors accumulated`);
+        recommendations.push("Check list_mailbox_errors for the actual error messages. Common causes: SMTP auth failure, rate limit, blacklisted IP.");
+      }
+      if (syncErrors > 5) {
+        issues.push(`${syncErrors} sync errors accumulated`);
+        recommendations.push("IMAP sync issues — verify credentials, check 'Less secure apps' for Gmail, or app password for 2FA accounts.");
+      }
+      if (lastSendAt) {
+        const lastSendMs = new Date(lastSendAt).getTime();
+        const hoursSince = (Date.now() - lastSendMs) / (1000 * 60 * 60);
+        if (hoursSince > 24) {
+          issues.push(`No send activity for ${Math.round(hoursSince)}h (last send: ${lastSendAt})`);
+        }
+      } else {
+        issues.push("Mailbox has never sent any email (last_send_at is null)");
+      }
+      if (!lastSyncAt) {
+        issues.push("Mailbox has never synced (last_sync_at is null) — likely connection problem on initial setup");
+      }
+      if (issues.length === 0) {
+        issues.push("No issues detected. Mailbox appears healthy.");
+      }
+
+      return jsonResult({
+        uuid: mailbox.uuid,
+        email: mailbox.email,
+        provider: mailbox.provider,
+        sender_name: mailbox.sender_name,
+        send_status: sendStatus,
+        sync_status: syncStatus,
+        send_errors_count: sendErrors,
+        sync_errors_count: syncErrors,
+        last_send_at: lastSendAt,
+        last_sync_at: lastSyncAt,
+        automation_daily_limit: mailbox.automation_daily_limit,
+        automation_task_interval: mailbox.automation_task_interval,
+        connection_settings: masked,
+        proxy_settings: maskedProxy,
+        sender_profile_uuid: mailbox.sender_profile_uuid,
+        team_id: mailbox.team_id,
+        issues,
+        recommendations,
+        is_healthy: sendStatus === "active" && syncStatus === "active" && sendErrors <= 5 && syncErrors <= 5,
+      });
+    },
+  );
+
+  server.tool(
+    "get_health_snapshots",
+    "Fleet-wide health snapshot of all LinkedIn sending accounts in one call. Returns each browser with status (active/paused/banned/etc.), cookie_status (valid/expired), health_score, daily_limit + usage today, last_run_at, proxy info. Use for morning triage or fleet overview without making N separate get_linkedin_browser calls. For deep single-account diagnosis use diagnose_linkedin_browser, for per-account limits-only check use check_linkedin_limits (alias).",
+    {
+      limit: z.number().optional().describe("Max browsers to return (default 50)"),
+      include_paused: z.boolean().optional().describe("Include browsers with status=paused (default true)"),
+    },
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async (params) => {
+      const body: Record<string, unknown> = {
+        limit: params.limit ?? 50,
+        offset: 0,
+      };
+      const result = await grinfiRequest("POST", "/browsers/api/linkedin-browsers/list", body) as Record<string, unknown>;
+      const browsers = Array.isArray(result.data) ? result.data as Record<string, unknown>[] : [];
+
+      const filtered = (params.include_paused ?? true) ? browsers : browsers.filter((b) => b.status !== "paused");
+
+      const snapshots = filtered.map((b) => {
+        const dailyLimit = (b.daily_limit as number | undefined) ?? null;
+        const usageToday = (b.usage_today as number | undefined) ?? null;
+        const remaining = dailyLimit !== null && usageToday !== null ? Math.max(0, dailyLimit - usageToday) : null;
+        return {
+          id: b.id,
+          uuid: b.uuid,
+          name: b.name ?? b.email ?? null,
+          status: b.status,
+          cookie_status: b.cookie_status ?? null,
+          health_score: b.health_score ?? null,
+          daily_limit: dailyLimit,
+          usage_today: usageToday,
+          remaining_today: remaining,
+          last_run_at: b.last_run_at ?? null,
+          proxy: b.proxy ?? null,
+          sender_profile_uuid: b.sender_profile_uuid ?? null,
+        };
+      });
+
+      const byStatus: Record<string, number> = {};
+      let totalUsageToday = 0;
+      let totalDailyLimit = 0;
+      for (const s of snapshots) {
+        const k = String(s.status ?? "unknown");
+        byStatus[k] = (byStatus[k] ?? 0) + 1;
+        if (typeof s.usage_today === "number") totalUsageToday += s.usage_today;
+        if (typeof s.daily_limit === "number") totalDailyLimit += s.daily_limit;
+      }
+
+      const flags: string[] = [];
+      const cookieExpired = snapshots.filter((s) => s.cookie_status === "expired").length;
+      const lowHealth = snapshots.filter((s) => typeof s.health_score === "number" && (s.health_score as number) < 50).length;
+      const overlimit = snapshots.filter((s) => s.remaining_today === 0 && (s.daily_limit ?? 0) > 0).length;
+      if (cookieExpired > 0) flags.push(`${cookieExpired} browser(s) have expired cookies — refresh via cloud browser.`);
+      if (lowHealth > 0) flags.push(`${lowHealth} browser(s) have low health score (<50). Consider diagnose_linkedin_browser for root cause.`);
+      if (overlimit > 0) flags.push(`${overlimit} browser(s) hit their daily limit. They will resume tomorrow.`);
+
+      return jsonResult({
+        total: snapshots.length,
+        by_status: byStatus,
+        usage_today_total: totalUsageToday,
+        daily_limit_total: totalDailyLimit,
+        capacity_remaining: totalDailyLimit - totalUsageToday,
+        flags,
+        snapshots,
+      });
+    },
+  );
+
+  // ===========================
+  // LINKEDIN BROWSERS
+  // ===========================
+
+  server.tool("list_linkedin_browsers", "List all LinkedIn browser profiles with pagination.", {
+    limit: z.number().optional(), offset: z.number().optional(),
+    order_field: z.string().optional(), order_type: z.enum(["asc", "desc"]).optional(),
+  },
+    { readOnlyHint: true, destructiveHint: false },
+    async (params) => {
+    const body: Record<string, unknown> = {};
+    if (params.limit !== undefined) body.limit = params.limit;
+    if (params.offset !== undefined) body.offset = params.offset;
+    if (params.order_field) body.order_field = params.order_field;
+    if (params.order_type) body.order_type = params.order_type;
+    const result = await grinfiRequest("POST", "/browsers/api/linkedin-browsers/list", body);
+    return jsonResult(result);
+  });
+
+  server.tool("get_linkedin_browser", "Get a LinkedIn browser profile by ID.", {
+    id: z.number().describe("LinkedIn browser ID (integer)"),
+  },
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async (params) => {
+    const result = await grinfiRequest("GET", `/browsers/api/linkedin-browsers/${params.id}`);
+    return jsonResult(result);
+  });
+
+  server.tool(
+    "diagnose_linkedin_browser",
+    "Run a deep health diagnosis on a single LinkedIn sending account (browser/seat) by ID. Returns status, cookie_status, health_score, daily_limit + usage today, last_run_at, proxy info, plus a list of detected issues (cookie expired, low health, hit daily limit, no proxy assigned, etc.) with recommendations. For lightweight fleet overview use get_health_snapshots; for proxy-only connectivity check use check_linkedin_proxy (todo).",
+    {
+      id: z.number().describe("LinkedIn browser ID (integer)"),
+    },
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async (params) => {
+      const browser = await grinfiRequest("GET", `/browsers/api/linkedin-browsers/${params.id}`) as Record<string, unknown>;
+
+      const status = browser.status as string;
+      const cookieStatus = browser.cookie_status as string | null | undefined;
+      const healthScore = browser.health_score as number | null | undefined;
+      const dailyLimit = browser.daily_limit as number | null | undefined;
+      const usageToday = browser.usage_today as number | null | undefined;
+      const lastRunAt = browser.last_run_at as string | null | undefined;
+      const proxy = browser.proxy as Record<string, unknown> | null | undefined;
+
+      const maskedProxy = proxy ? { ...proxy, password: proxy.password ? "***MASKED***" : null } : null;
+
+      const issues: string[] = [];
+      const recommendations: string[] = [];
+
+      if (status !== "active") {
+        issues.push(`status is '${status}' (expected 'active')`);
+        if (status === "banned") recommendations.push("Account banned by LinkedIn — DO NOT retry. Investigate manually, may need to retire this seat.");
+        if (status === "paused") recommendations.push("Account is paused. Use run_linkedin_browser to resume.");
+        if (status === "stopped") recommendations.push("Account stopped. Check why (manual stop, error, or rate limit).");
+      }
+      if (cookieStatus === "expired" || cookieStatus === "invalid") {
+        issues.push(`cookie_status is '${cookieStatus}' — LinkedIn session expired`);
+        recommendations.push("Use share_linkedin_browser to get cloud browser URL, log into LinkedIn, refresh cookie.");
+      }
+      if (typeof healthScore === "number" && healthScore < 50) {
+        issues.push(`health_score is ${healthScore} (low; LinkedIn limiting actions)`);
+        recommendations.push("Reduce daily activity (lower daily_limit), let account 'cool down' for 1-2 days, then resume.");
+      }
+      if (dailyLimit !== null && dailyLimit !== undefined && usageToday !== null && usageToday !== undefined) {
+        const remaining = dailyLimit - usageToday;
+        if (remaining <= 0) {
+          issues.push(`Daily limit hit (${usageToday}/${dailyLimit}). Will resume tomorrow.`);
+        } else if (remaining < 5) {
+          issues.push(`Near daily limit (${usageToday}/${dailyLimit}, only ${remaining} actions left today)`);
+        }
+      }
+      if (!maskedProxy) {
+        issues.push("No proxy assigned — direct connection from server IP. LinkedIn may detect this as suspicious.");
+        recommendations.push("Assign a residential proxy via set_linkedin_browser_proxy.");
+      }
+      if (lastRunAt) {
+        const lastRunMs = new Date(lastRunAt).getTime();
+        const hoursSince = (Date.now() - lastRunMs) / (1000 * 60 * 60);
+        if (hoursSince > 48) {
+          issues.push(`No activity for ${Math.round(hoursSince)}h (last run: ${lastRunAt})`);
+        }
+      } else {
+        issues.push("Browser has never run (last_run_at is null) — never started or stuck on initial setup");
+      }
+      if (issues.length === 0) {
+        issues.push("No issues detected. Browser appears healthy.");
+      }
+
+      return jsonResult({
+        id: browser.id,
+        uuid: browser.uuid,
+        name: browser.name ?? null,
+        email: browser.email ?? null,
+        status,
+        cookie_status: cookieStatus,
+        health_score: healthScore,
+        daily_limit: dailyLimit,
+        usage_today: usageToday,
+        remaining_today: (dailyLimit ?? 0) - (usageToday ?? 0),
+        last_run_at: lastRunAt,
+        proxy: maskedProxy,
+        sender_profile_uuid: browser.sender_profile_uuid,
+        team_id: browser.team_id,
+        issues,
+        recommendations,
+        is_healthy: status === "active" && cookieStatus !== "expired" && cookieStatus !== "invalid" && (typeof healthScore !== "number" || healthScore >= 50),
+      });
+    },
+  );
+
+  server.tool("create_linkedin_browser", "Create a new LinkedIn browser profile linked to a sender profile.", {
+    sender_profile_uuid: z.string().describe("UUID of the sender profile to link"),
+    proxy_country_code: z.string().optional().describe("Proxy country code (e.g. US, DE)"),
+  },
+    { readOnlyHint: false, destructiveHint: false },
+    async (params) => {
+    const body: Record<string, unknown> = { sender_profile_uuid: params.sender_profile_uuid };
+    if (params.proxy_country_code) body.proxy_country_code = params.proxy_country_code;
+    const result = await grinfiRequest("POST", "/browsers/api/linkedin-browsers", body);
+    return jsonResult(result);
+  });
+
+  server.tool("delete_linkedin_browser", "Delete a LinkedIn browser profile by ID. This action is irreversible.", {
+    id: z.number().describe("LinkedIn browser ID to delete"),
+  },
+    { readOnlyHint: false, destructiveHint: true },
+    async (params) => {
+    const result = await grinfiRequest("DELETE", `/browsers/api/linkedin-browsers/${params.id}`);
+    return jsonResult(result);
+  });
+
+  server.tool("run_linkedin_browser", "Start a LinkedIn browser session to begin executing queued actions.", {
+    id: z.number().describe("LinkedIn browser ID"),
+  },
+    { readOnlyHint: false, destructiveHint: false },
+    async (params) => {
+    const result = await grinfiRequest("POST", `/browsers/api/linkedin-browsers/${params.id}/run`);
+    return jsonResult(result);
+  });
+
+  server.tool("stop_linkedin_browser", "Stop a running LinkedIn browser session.", {
+    id: z.number().describe("LinkedIn browser ID"),
+  },
+    { readOnlyHint: false, destructiveHint: false },
+    async (params) => {
+    const result = await grinfiRequest("POST", `/browsers/api/linkedin-browsers/${params.id}/stop`);
+    return jsonResult(result);
+  });
+
+  server.tool("set_linkedin_browser_proxy", "Change the proxy configuration for a LinkedIn browser.", {
+    id: z.number().describe("LinkedIn browser ID"),
+    proxy_country_code: z.string().describe("Proxy country code (e.g. US, DE)"),
+  },
+    { readOnlyHint: false, destructiveHint: false },
+    async (params) => {
+    const result = await grinfiRequest("POST", `/browsers/api/linkedin-browsers/${params.id}/set-proxy`, {
+      proxy_country_code: params.proxy_country_code,
+    });
+    return jsonResult(result);
+  });
+
+  server.tool("share_linkedin_browser", "Share a LinkedIn browser profile with team members by email.", {
+    id: z.number().describe("LinkedIn browser ID"),
+    recipients: z.array(z.string()).describe("Email addresses of team members to share with"),
+  },
+    { readOnlyHint: false, destructiveHint: false },
+    async (params) => {
+    const result = await grinfiRequest("POST", `/browsers/api/linkedin-browsers/${params.id}/share`, {
+      recipients: params.recipients,
+    });
+    return jsonResult(result);
+  });
+
+  // ===========================
+  // DATA SOURCES (LinkedIn import jobs)
+  // ===========================
+
+  server.tool("list_data_sources", "List LinkedIn import jobs (data sources) with pagination.", {
+    limit: z.number().optional(), offset: z.number().optional(),
+    order_field: z.string().optional(), order_type: z.enum(["asc", "desc"]).optional(),
+  },
+    { readOnlyHint: true, destructiveHint: false },
+    async (params) => {
+    const result = await grinfiRequest("GET", "/leads/api/data-sources", undefined, buildQuery(params));
+    return jsonResult(result);
+  });
+
+  server.tool("get_data_source", "Get a data source (LinkedIn import job) by UUID.", {
+    uuid: z.string().describe("UUID of the data source"),
+  },
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async (params) => {
+    const result = await grinfiRequest("GET", `/leads/api/data-sources/${params.uuid}`);
+    return jsonResult(result);
+  });
+
+  server.tool("create_data_source", "Create a new LinkedIn import job. Imports contacts from LinkedIn searches, lists, or Sales Navigator into a contact list.", {
+    type: z.enum(["csv_leads", "sn_leads_search", "sn_leads_saved_search", "sn_leads_list", "sn_accounts_search", "sn_accounts_saved_search", "sn_accounts_list", "ln_leads_search", "ln_accounts_search", "ln_my_network", "ln_my_messenger", "post_engagement", "recruiter_leads_search"]).describe("Type of import source"),
+    list_uuid: z.string().describe("UUID of the contact list to import into"),
+    payload: z.record(z.string(), z.unknown()).optional().describe("Import configuration specific to the data source type"),
+    tags: z.array(z.string()).optional().describe("Tags to apply to imported contacts"),
+  },
+    { readOnlyHint: false, destructiveHint: false },
+    async (params) => {
+    const body: Record<string, unknown> = { type: params.type, list_uuid: params.list_uuid };
+    if (params.payload) body.payload = params.payload;
+    if (params.tags) body.tags = params.tags;
+    const result = await grinfiRequest("POST", "/leads/api/data-sources", body);
+    return jsonResult(result);
+  });
+
+  server.tool("update_data_source", "Update a data source by UUID.", {
+    uuid: z.string().describe("UUID of the data source"),
+    type: z.string().optional(),
+    list_uuid: z.string().optional(),
+    payload: z.record(z.string(), z.unknown()).optional(),
+    tags: z.array(z.string()).nullable().optional(),
+  },
+    { readOnlyHint: false, destructiveHint: false },
+    async (params) => {
+    const { uuid, ...fields } = params;
+    const body: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(fields)) { if (v !== undefined) body[k] = v; }
+    const result = await grinfiRequest("PUT", `/leads/api/data-sources/${uuid}`, body);
+    return jsonResult(result);
+  });
+
+  server.tool("delete_data_source", "Delete a data source (import job) by UUID.", {
+    uuid: z.string().describe("UUID of the data source to delete"),
+  },
+    { readOnlyHint: false, destructiveHint: true },
+    async (params) => {
+    const result = await grinfiRequest("DELETE", `/leads/api/data-sources/${params.uuid}`);
+    return jsonResult(result);
+  });
+
+  // ===========================
+  // ACCOUNT (current user, teams)
+  // ===========================
+
+  server.tool("get_current_user", "Get the current authenticated user's profile and configuration.", {},
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async () => {
+    const result = await grinfiRequest("GET", "/id/api/users/current");
+    return jsonResult(result);
+  });
+
+  server.tool("list_teams", "List all teams (workspaces) available to the current user via the Grinfi API. Different from list_my_teams (which lists locally-configured team API keys). Use to discover team IDs.", {
+    limit: z.number().optional(), offset: z.number().optional(),
+  },
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async (params) => {
+    const result = await grinfiRequest("GET", "/id/api/teams", undefined, buildQuery(params));
+    return jsonResult(result);
+  });
+
+  server.tool("get_team", "Get details of a specific team by numeric ID.", {
+    id: z.number().describe("Team ID (integer, not UUID)"),
+  },
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async (params) => {
+    const result = await grinfiRequest("GET", `/id/api/teams/${params.id}`);
+    return jsonResult(result);
+  });
+
+  // ===========================
+  // INTEGRATIONS / DIAGNOSTICS — outbound log, external API call, LLM smoke test
+  // ===========================
+
+  server.tool(
+    "call_external_api",
+    "Dispatch a one-off outbound HTTP request to a PUBLIC external URL. Use for ad-hoc third-party API calls (Calendly, custom endpoints), probing partner APIs, or debugging integrations. Returns downstream status code, headers, and response body. SECURITY: only public URLs allowed — localhost / 127.x / private IP ranges (10.x, 172.16-31.x, 192.168.x, 169.254.x) are blocked. Max body 1MB. Timeout 30s. Use test_webhook for testing registered webhooks instead.",
+    {
+      method: z.enum(["GET", "POST", "PUT", "DELETE", "PATCH"]).describe("HTTP method"),
+      url: z.string().url().describe("Public external URL (must be HTTPS or HTTP, no localhost/private IPs)"),
+      headers: z.record(z.string(), z.string()).optional().describe("Request headers"),
+      body: z.unknown().optional().describe("Request body (JSON-serializable for POST/PUT/PATCH)"),
+      timeout_ms: z.number().int().min(1000).max(60000).optional().describe("Request timeout in ms (default 30000, max 60000)"),
+    },
+    { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
+    async (params) => {
+      let parsedUrl: URL;
+      try {
+        parsedUrl = new URL(params.url);
+      } catch {
+        return jsonResult({ error: "Invalid URL" });
+      }
+      if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
+        return jsonResult({ error: "Only http:// and https:// URLs are allowed" });
+      }
+      const hostname = parsedUrl.hostname.toLowerCase();
+
+      if (hostname === "localhost" || hostname === "0.0.0.0" || hostname.endsWith(".localhost")) {
+        return jsonResult({ error: `Localhost URL blocked (SSRF protection): ${hostname}` });
+      }
+      if (hostname === "::1" || hostname === "[::1]") {
+        return jsonResult({ error: "IPv6 localhost blocked (SSRF protection)" });
+      }
+      const ipv4Match = hostname.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+      if (ipv4Match) {
+        const [a, b] = ipv4Match.slice(1).map(Number);
+        const isPrivate =
+          a === 10 ||
+          a === 127 ||
+          (a === 172 && b >= 16 && b <= 31) ||
+          (a === 192 && b === 168) ||
+          (a === 169 && b === 254) ||
+          a === 0 ||
+          a >= 224;
+        if (isPrivate) {
+          return jsonResult({ error: `Private/reserved IP blocked (SSRF protection): ${hostname}` });
+        }
+      }
+
+      const timeoutMs = params.timeout_ms ?? 30000;
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+      const startedAt = Date.now();
+      try {
+        const init: RequestInit = {
+          method: params.method,
+          headers: params.headers ?? {},
+          signal: ctrl.signal,
+        };
+        if (params.body !== undefined && (params.method === "POST" || params.method === "PUT" || params.method === "PATCH")) {
+          if (typeof params.body === "string") {
+            init.body = params.body;
+          } else {
+            init.body = JSON.stringify(params.body);
+            if (!params.headers || !Object.keys(params.headers).some((k) => k.toLowerCase() === "content-type")) {
+              (init.headers as Record<string, string>)["Content-Type"] = "application/json";
+            }
+          }
+        }
+        const response = await fetch(params.url, init);
+        const latencyMs = Date.now() - startedAt;
+        const responseHeaders: Record<string, string> = {};
+        response.headers.forEach((v, k) => { responseHeaders[k] = v; });
+        const text = await response.text();
+        const trimmed = text.length > 1_000_000 ? text.slice(0, 1_000_000) + "\n\n[TRUNCATED — body exceeded 1MB]" : text;
+        let parsedBody: unknown = trimmed;
+        try { parsedBody = JSON.parse(trimmed); } catch { /* keep as text */ }
+
+        return jsonResult({
+          ok: response.ok,
+          status: response.status,
+          status_text: response.statusText,
+          latency_ms: latencyMs,
+          headers: responseHeaders,
+          body: parsedBody,
+          body_length: text.length,
+        });
+      } catch (err) {
+        const latencyMs = Date.now() - startedAt;
+        const message = err instanceof Error ? err.message : String(err);
+        return jsonResult({
+          ok: false,
+          latency_ms: latencyMs,
+          error: message,
+          aborted: ctrl.signal.aborted,
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+    },
+  );
+
+  server.tool("list_outbound_log", "Read the outbound HTTP request log — every webhook delivery, automation API call, enrichment request the system has made to external URLs. Each entry shows status, retry_count, errors, request_method/url/headers/body, executor_type ('webhook'/'automation'/'enrichment'), executor_key (event name like 'contact_replied_linkedin_message'). Use to diagnose webhook delivery failures, audit recent deliveries, debug partner integrations, or see what data was sent to which endpoint. Use get_webhook_logs if you only want delivery history for one specific webhook UUID.", {
+    limit: z.number().optional().describe("Number of entries (default 20)"),
+    offset: z.number().optional(),
+    order_field: z.string().optional().describe("default: created_at"),
+    order_type: z.enum(["asc", "desc"]).optional().describe("default: desc"),
+    status: z.enum(["done", "pending", "failed", "in_progress"]).optional().describe("Filter by delivery status"),
+    executor_type: z.string().optional().describe("Filter by executor type (webhook / automation / enrichment)"),
+    executor_key: z.string().optional().describe("Filter by event name (e.g. 'contact_replied_linkedin_message')"),
+  },
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async (params) => {
+      const query: Record<string, string> = {};
+      if (params.limit !== undefined) query.limit = String(params.limit);
+      if (params.offset !== undefined) query.offset = String(params.offset);
+      if (params.order_field) query.order_field = params.order_field;
+      if (params.order_type) query.order_type = params.order_type;
+      if (params.status) query["filter[status]"] = params.status;
+      if (params.executor_type) query["filter[executor_type]"] = params.executor_type;
+      if (params.executor_key) query["filter[executor_key]"] = params.executor_key;
+      const result = await grinfiRequest("GET", "/integrations/c1/api/request-schedules", undefined, query);
+      return jsonResult(result);
+    },
+  );
+
+  server.tool("test_llm_connection", "Smoke-test a stored LLM integration by running a tiny completion ('respond with the word OK'). Returns ok:true with latency_ms on success, or ok:false with error details. Use after create_llm/update_llm to verify the credential and model work, or to audit if a stored key is still active. Costs ~5 tokens of provider credits per test.", {
+    uuid: z.string().describe("UUID of the LLM integration to test"),
+    job_type: z.enum(["ai_variable", "ai_template", "ai_agent"]).optional().describe("Job type for the test call (default: ai_template)"),
+  },
+    { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+    async (params) => {
+      const startedAt = Date.now();
+      try {
+        const result = await grinfiRequest("POST", `/ai/api/llms/${params.uuid}/generate`, {
+          job_type: params.job_type ?? "ai_template",
+          messages: [{ role: "user", content: "Respond with exactly the word 'OK' and nothing else." }],
+          config: { max_tokens: 10 },
+        }) as Record<string, unknown>;
+        const latencyMs = Date.now() - startedAt;
+        const responseText = typeof result.text === "string" ? result.text
+          : typeof result.content === "string" ? result.content
+          : typeof result.response === "string" ? result.response
+          : JSON.stringify(result).slice(0, 200);
+        return jsonResult({
+          ok: true,
+          latency_ms: latencyMs,
+          llm_uuid: params.uuid,
+          response_preview: responseText.slice(0, 100),
+        });
+      } catch (err) {
+        const latencyMs = Date.now() - startedAt;
+        const message = err instanceof Error ? err.message : String(err);
+        return jsonResult({
+          ok: false,
+          latency_ms: latencyMs,
+          llm_uuid: params.uuid,
+          error: message,
+        });
+      }
     },
   );
 
