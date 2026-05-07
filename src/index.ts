@@ -1942,66 +1942,50 @@ function createMcpServer(): McpServer {
   );
 
   // ===========================
-  // FLOW WORKSPACES (automation folders)
+  // AUTOMATION FOLDERS
   // ===========================
 
-  server.tool(
-    "list_flow_workspaces",
-    "List automation folders (flow workspaces). Used to organize automations into groups.",
-    {
-      limit: z.number().optional(), offset: z.number().optional(),
-      order_field: z.string().optional(), order_type: z.enum(["asc", "desc"]).optional(),
-      search: z.string().optional(),
-    },
-    async (params) => {
-      const result = await grinfiRequest("GET", "/flows/api/flow-workspaces", undefined, buildQuery(params));
-      return jsonResult(result);
-    },
-  );
+  server.tool("list_automation_folders", "List all automation folders (workspaces) for organizing automations.", {},
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async () => {
+    const result = await grinfiRequest("GET", "/flows/api/flow-workspaces");
+    return jsonResult(result);
+  });
 
-  server.tool(
-    "create_flow_workspace",
-    "Create a new automation folder.",
-    {
-      name: z.string().describe("Folder name"),
-      description: z.string().optional(),
-    },
+  server.tool("create_automation_folder", "Create a new automation folder.", {
+    name: z.string().describe("Name of the folder"),
+    order: z.number().optional().describe("Display order position"),
+  },
+    { readOnlyHint: false, destructiveHint: false },
     async (params) => {
-      const body: Record<string, unknown> = { name: params.name };
-      if (params.description) body.description = params.description;
-      const result = await grinfiRequest("POST", "/flows/api/flow-workspaces", body);
-      return jsonResult(result);
-    },
-  );
+    const body: Record<string, unknown> = { name: params.name };
+    if (params.order !== undefined) body.order = params.order;
+    const result = await grinfiRequest("POST", "/flows/api/flow-workspaces", body);
+    return jsonResult(result);
+  });
 
-  server.tool(
-    "update_flow_workspace",
-    "Rename or update an automation folder.",
-    {
-      uuid: z.string().describe("UUID of the flow workspace"),
-      name: z.string().optional(),
-      description: z.string().optional(),
-    },
+  server.tool("update_automation_folder", "Update an automation folder's name or display order.", {
+    uuid: z.string().describe("UUID of the automation folder"),
+    name: z.string().optional(),
+    order: z.number().optional(),
+  },
+    { readOnlyHint: false, destructiveHint: false },
     async (params) => {
-      const { uuid, ...fields } = params;
-      const body: Record<string, unknown> = {};
-      for (const [k, v] of Object.entries(fields)) { if (v !== undefined) body[k] = v; }
-      const result = await grinfiRequest("PUT", `/flows/api/flow-workspaces/${uuid}`, body);
-      return jsonResult(result);
-    },
-  );
+    const { uuid, ...fields } = params;
+    const body: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(fields)) { if (v !== undefined) body[k] = v; }
+    const result = await grinfiRequest("PUT", `/flows/api/flow-workspaces/${uuid}`, body);
+    return jsonResult(result);
+  });
 
-  server.tool(
-    "delete_flow_workspace",
-    "Delete an automation folder by UUID. Automations inside are not deleted, but become unfiled.",
-    {
-      uuid: z.string().describe("UUID of the flow workspace to delete"),
-    },
+  server.tool("delete_automation_folder", "Delete an automation folder by UUID.", {
+    uuid: z.string().describe("UUID of the automation folder to delete"),
+  },
+    { readOnlyHint: false, destructiveHint: true },
     async (params) => {
-      const result = await grinfiRequest("DELETE", `/flows/api/flow-workspaces/${params.uuid}`);
-      return jsonResult(result);
-    },
-  );
+    const result = await grinfiRequest("DELETE", `/flows/api/flow-workspaces/${params.uuid}`);
+    return jsonResult(result);
+  });
 
   server.tool(
     "list_flow_leads",
