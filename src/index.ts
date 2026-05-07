@@ -3378,6 +3378,169 @@ function createMcpServer(): McpServer {
     return jsonResult(result);
   });
 
+  // ===========================
+  // INTEGRATIONS / DIAGNOSTICS — outbound log, external API call, LLM smoke test
+  // ===========================
+
+  server.tool(
+    "call_external_api",
+    "Dispatch a one-off outbound HTTP request to a PUBLIC external URL. Use for ad-hoc third-party API calls (Calendly, custom endpoints), probing partner APIs, or debugging integrations. Returns downstream status code, headers, and response body. SECURITY: only public URLs allowed — localhost / 127.x / private IP ranges (10.x, 172.16-31.x, 192.168.x, 169.254.x) are blocked. Max body 1MB. Timeout 30s. Use test_webhook for testing registered webhooks instead.",
+    {
+      method: z.enum(["GET", "POST", "PUT", "DELETE", "PATCH"]).describe("HTTP method"),
+      url: z.string().url().describe("Public external URL (must be HTTPS or HTTP, no localhost/private IPs)"),
+      headers: z.record(z.string(), z.string()).optional().describe("Request headers"),
+      body: z.unknown().optional().describe("Request body (JSON-serializable for POST/PUT/PATCH)"),
+      timeout_ms: z.number().int().min(1000).max(60000).optional().describe("Request timeout in ms (default 30000, max 60000)"),
+    },
+    { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
+    async (params) => {
+      let parsedUrl: URL;
+      try {
+        parsedUrl = new URL(params.url);
+      } catch {
+        return jsonResult({ error: "Invalid URL" });
+      }
+      if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
+        return jsonResult({ error: "Only http:// and https:// URLs are allowed" });
+      }
+      const hostname = parsedUrl.hostname.toLowerCase();
+
+      if (hostname === "localhost" || hostname === "0.0.0.0" || hostname.endsWith(".localhost")) {
+        return jsonResult({ error: `Localhost URL blocked (SSRF protection): ${hostname}` });
+      }
+      if (hostname === "::1" || hostname === "[::1]") {
+        return jsonResult({ error: "IPv6 localhost blocked (SSRF protection)" });
+      }
+      const ipv4Match = hostname.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+      if (ipv4Match) {
+        const [a, b] = ipv4Match.slice(1).map(Number);
+        const isPrivate =
+          a === 10 ||
+          a === 127 ||
+          (a === 172 && b >= 16 && b <= 31) ||
+          (a === 192 && b === 168) ||
+          (a === 169 && b === 254) ||
+          a === 0 ||
+          a >= 224;
+        if (isPrivate) {
+          return jsonResult({ error: `Private/reserved IP blocked (SSRF protection): ${hostname}` });
+        }
+      }
+
+      const timeoutMs = params.timeout_ms ?? 30000;
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+      const startedAt = Date.now();
+      try {
+        const init: RequestInit = {
+          method: params.method,
+          headers: params.headers ?? {},
+          signal: ctrl.signal,
+        };
+        if (params.body !== undefined && (params.method === "POST" || params.method === "PUT" || params.method === "PATCH")) {
+          if (typeof params.body === "string") {
+            init.body = params.body;
+          } else {
+            init.body = JSON.stringify(params.body);
+            if (!params.headers || !Object.keys(params.headers).some((k) => k.toLowerCase() === "content-type")) {
+              (init.headers as Record<string, string>)["Content-Type"] = "application/json";
+            }
+          }
+        }
+        const response = await fetch(params.url, init);
+        const latencyMs = Date.now() - startedAt;
+        const responseHeaders: Record<string, string> = {};
+        response.headers.forEach((v, k) => { responseHeaders[k] = v; });
+        const text = await response.text();
+        const trimmed = text.length > 1_000_000 ? text.slice(0, 1_000_000) + "\n\n[TRUNCATED — body exceeded 1MB]" : text;
+        let parsedBody: unknown = trimmed;
+        try { parsedBody = JSON.parse(trimmed); } catch { /* keep as text */ }
+
+        return jsonResult({
+          ok: response.ok,
+          status: response.status,
+          status_text: response.statusText,
+          latency_ms: latencyMs,
+          headers: responseHeaders,
+          body: parsedBody,
+          body_length: text.length,
+        });
+      } catch (err) {
+        const latencyMs = Date.now() - startedAt;
+        const message = err instanceof Error ? err.message : String(err);
+        return jsonResult({
+          ok: false,
+          latency_ms: latencyMs,
+          error: message,
+          aborted: ctrl.signal.aborted,
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+    },
+  );
+
+  server.tool("list_outbound_log", "Read the outbound HTTP request log — every webhook delivery, automation API call, enrichment request the system has made to external URLs. Each entry shows status, retry_count, errors, request_method/url/headers/body, executor_type ('webhook'/'automation'/'enrichment'), executor_key (event name like 'contact_replied_linkedin_message'). Use to diagnose webhook delivery failures, audit recent deliveries, debug partner integrations, or see what data was sent to which endpoint. Use get_webhook_logs if you only want delivery history for one specific webhook UUID.", {
+    limit: z.number().optional().describe("Number of entries (default 20)"),
+    offset: z.number().optional(),
+    order_field: z.string().optional().describe("default: created_at"),
+    order_type: z.enum(["asc", "desc"]).optional().describe("default: desc"),
+    status: z.enum(["done", "pending", "failed", "in_progress"]).optional().describe("Filter by delivery status"),
+    executor_type: z.string().optional().describe("Filter by executor type (webhook / automation / enrichment)"),
+    executor_key: z.string().optional().describe("Filter by event name (e.g. 'contact_replied_linkedin_message')"),
+  },
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async (params) => {
+      const query: Record<string, string> = {};
+      if (params.limit !== undefined) query.limit = String(params.limit);
+      if (params.offset !== undefined) query.offset = String(params.offset);
+      if (params.order_field) query.order_field = params.order_field;
+      if (params.order_type) query.order_type = params.order_type;
+      if (params.status) query["filter[status]"] = params.status;
+      if (params.executor_type) query["filter[executor_type]"] = params.executor_type;
+      if (params.executor_key) query["filter[executor_key]"] = params.executor_key;
+      const result = await grinfiRequest("GET", "/integrations/c1/api/request-schedules", undefined, query);
+      return jsonResult(result);
+    },
+  );
+
+  server.tool("test_llm_connection", "Smoke-test a stored LLM integration by running a tiny completion ('respond with the word OK'). Returns ok:true with latency_ms on success, or ok:false with error details. Use after create_llm/update_llm to verify the credential and model work, or to audit if a stored key is still active. Costs ~5 tokens of provider credits per test.", {
+    uuid: z.string().describe("UUID of the LLM integration to test"),
+    job_type: z.enum(["ai_variable", "ai_template", "ai_agent"]).optional().describe("Job type for the test call (default: ai_template)"),
+  },
+    { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+    async (params) => {
+      const startedAt = Date.now();
+      try {
+        const result = await grinfiRequest("POST", `/ai/api/llms/${params.uuid}/generate`, {
+          job_type: params.job_type ?? "ai_template",
+          messages: [{ role: "user", content: "Respond with exactly the word 'OK' and nothing else." }],
+          config: { max_tokens: 10 },
+        }) as Record<string, unknown>;
+        const latencyMs = Date.now() - startedAt;
+        const responseText = typeof result.text === "string" ? result.text
+          : typeof result.content === "string" ? result.content
+          : typeof result.response === "string" ? result.response
+          : JSON.stringify(result).slice(0, 200);
+        return jsonResult({
+          ok: true,
+          latency_ms: latencyMs,
+          llm_uuid: params.uuid,
+          response_preview: responseText.slice(0, 100),
+        });
+      } catch (err) {
+        const latencyMs = Date.now() - startedAt;
+        const message = err instanceof Error ? err.message : String(err);
+        return jsonResult({
+          ok: false,
+          latency_ms: latencyMs,
+          llm_uuid: params.uuid,
+          error: message,
+        });
+      }
+    },
+  );
+
   // --- Multi-team tools (only registered when GRINFI_TEAM_KEYS is set) ---
 
   if (teamKeys.length > 0) {
