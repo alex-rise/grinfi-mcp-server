@@ -2189,6 +2189,339 @@ function createMcpServer(): McpServer {
     },
   );
 
+  // ===========================
+  // FAILED-TASK TRIAGE — diagnose / restart / skip / restart-from-top
+  // ===========================
+
+  server.tool(
+    "diagnose_failed_tasks",
+    "Diagnose failed/canceled automation tasks across a flow / sender / period. Read-only. Returns failure breakdown by automation_error_code (replied / too_many_attempts / unknown), per-sender counts, sample task records (with first-line error_summary), and free-text pattern hints (captcha/proxy/rate-limit detection). Use BEFORE bulk_retry to confirm there is something retryable and to spot patterns that need a human (proxy down, account banned, etc.). Filter by period (24h/7d/30d), flow_uuid, sender_profile_uuid, status (failed/canceled/both). DOES NOT mutate state.",
+    {
+      flow_uuid: z.string().optional().describe("Optional flow UUID — scope diagnosis to one automation. Resolve via list_automations."),
+      sender_profile_uuid: z.string().optional().describe("Optional sender profile UUID — scope diagnosis to one sender. Resolve via list_sender_profiles."),
+      period: z.enum(["24h", "7d", "30d"]).optional().describe("Lookback window (default '24h'). Filters tasks by schedule_at >= now - period."),
+      limit: z.number().int().min(1).max(200).optional().describe("Max sample tasks to fetch for pattern hints + samples block (default 100, cap 200)."),
+      status: z.enum(["failed", "canceled", "both"]).optional().describe("Status of tasks to diagnose. 'failed' (default), 'canceled' (where 'replied' code typically appears), 'both' for combined view."),
+      verbose: z.boolean().optional().describe("If true, return full error_msg per sample (no truncation). Default false — error_msg trimmed to 500 chars; error_summary always provided as first-line digest."),
+      include_internal: z.boolean().optional().describe("If true, include internal task types (util_timer, trigger_*) in samples / by_sender / pattern_hints. Default false — internal types are noise that mask real outreach failures."),
+    },
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async (params) => {
+      const periodMs: Record<"24h" | "7d" | "30d", number> = {
+        "24h": 24 * 60 * 60 * 1000,
+        "7d": 7 * 24 * 60 * 60 * 1000,
+        "30d": 30 * 24 * 60 * 60 * 1000,
+      };
+      const period = params.period ?? "24h";
+      const since = new Date(Date.now() - periodMs[period]).toISOString();
+      const sampleLimit = params.limit ?? 100;
+      const verbose = params.verbose ?? false;
+      const includeInternal = params.include_internal ?? false;
+
+      const status = params.status ?? "failed";
+      const statusFilter: unknown = status === "both" ? ["failed", "canceled"] : status;
+
+      const filter: Record<string, unknown> = {
+        status: statusFilter,
+        schedule_at: { ">=": since },
+      };
+      if (params.flow_uuid) filter.flow_uuid = params.flow_uuid;
+      if (params.sender_profile_uuid) filter.sender_profile_uuid = params.sender_profile_uuid;
+
+      const internalTypes = ["util_timer", "trigger_message_replied", "trigger_completed", "trigger_paused"];
+      if (!includeInternal) {
+        filter.type = { "!=": internalTypes };
+      }
+
+      const [byErrorCode, bySender, samplesResult] = await Promise.all([
+        grinfiRequest("POST", "/flows/api/tasks/group-counts", { filter, group_field: "automation_error_code" }),
+        grinfiRequest("POST", "/flows/api/tasks/group-counts", { filter, group_field: "sender_profile_uuid" }),
+        grinfiRequest("POST", "/flows/api/tasks/list", { filter, limit: sampleLimit, order_field: "schedule_at", order_type: "desc" }),
+      ]);
+
+      function toCountArr(payload: unknown): { value: string; count: number }[] {
+        if (payload && typeof payload === "object") {
+          const obj = payload as Record<string, unknown>;
+          const dataField = obj.data;
+          if (Array.isArray(dataField)) return dataField as { value: string; count: number }[];
+          const arr: { value: string; count: number }[] = [];
+          for (const [k, v] of Object.entries(obj)) {
+            if (typeof v === "number") {
+              arr.push({ value: k === "" ? "unclassified" : k, count: v });
+            }
+          }
+          return arr;
+        }
+        return [];
+      }
+
+      const byErrCodeArr = toCountArr(byErrorCode);
+      const bySenderArr = toCountArr(bySender);
+
+      const senderUuids = bySenderArr.map((b) => b.value).filter((u): u is string => typeof u === "string" && u.length > 0 && u !== "unclassified");
+      const senderNames: Record<string, string> = {};
+      await Promise.all(
+        senderUuids.map(async (uuid) => {
+          try {
+            const r = await grinfiRequest("GET", `/flows/api/sender-profiles/${uuid}`) as { name?: string; email?: string };
+            senderNames[uuid] = r.name ?? r.email ?? uuid;
+          } catch {
+            senderNames[uuid] = uuid;
+          }
+        }),
+      );
+
+      const samplesArr = Array.isArray((samplesResult as { data?: unknown }).data)
+        ? ((samplesResult as { data: Record<string, unknown>[] }).data)
+        : [];
+      const flowUuids = Array.from(new Set(samplesArr.map((s) => s.flow_uuid as string).filter((u): u is string => typeof u === "string" && u.length > 0)));
+      const flowNames: Record<string, string> = {};
+      await Promise.all(
+        flowUuids.map(async (uuid) => {
+          try {
+            const r = await grinfiRequest("GET", `/flows/api/flows/${uuid}`) as { name?: string };
+            flowNames[uuid] = r.name ?? uuid;
+          } catch {
+            flowNames[uuid] = uuid;
+          }
+        }),
+      );
+
+      function firstLine(s: string): string {
+        const i = s.indexOf("\n");
+        return i === -1 ? s : s.slice(0, i);
+      }
+
+      const samples = samplesArr.map((t) => {
+        const errorMsgRaw = typeof t.error_msg === "string" ? t.error_msg : "";
+        const errorSummary = errorMsgRaw ? firstLine(errorMsgRaw).slice(0, 200) : "";
+        const errorMsg = verbose ? errorMsgRaw : (errorMsgRaw.length > 500 ? errorMsgRaw.slice(0, 500) + "…" : errorMsgRaw);
+        const senderUuid = t.sender_profile_uuid as string | undefined;
+        const flowUuid = t.flow_uuid as string | undefined;
+        return {
+          uuid: t.uuid,
+          type: t.type,
+          status: t.status,
+          automation_error_code: t.automation_error_code ?? null,
+          schedule_at: t.schedule_at,
+          flow_uuid: flowUuid,
+          flow_name: flowUuid ? flowNames[flowUuid] : undefined,
+          sender_profile_uuid: senderUuid,
+          sender_name: senderUuid ? senderNames[senderUuid] : undefined,
+          lead_uuid: t.lead_uuid,
+          attempts: t.attempts,
+          error_summary: errorSummary,
+          error_msg: errorMsg,
+        };
+      });
+
+      const patternHints: string[] = [];
+      const allErrors = samples.map((s) => (s.error_msg ?? "").toLowerCase()).join(" ");
+      if (/captcha|recaptcha|verify\s+you/.test(allErrors)) {
+        patternHints.push("CAPTCHA detected — at least one sender hit a LinkedIn challenge. Manual cookie refresh likely needed.");
+      }
+      if (/proxy|connection\s+refused|connect\s+timeout|connect\s+to\s+server|couldn'?t\s+connect|failed\s+to\s+connect|enotfound|econnrefused|etimedout|curl\s+error\s+7|curl\s+error\s+28/.test(allErrors)) {
+        patternHints.push("Proxy/network connectivity issues detected (cURL connect errors, refused connections). Check sender proxy via diagnose_linkedin_browser or replace_proxy.");
+      }
+      if (/rate\s*limit|429|too\s+many\s+requests/.test(allErrors)) {
+        patternHints.push("Rate-limit signals detected — back off, reduce daily caps, or wait for cooldown before retry.");
+      }
+      if (/banned|suspended|account\s+restricted|account\s+is\s+disabled/.test(allErrors)) {
+        patternHints.push("Account ban/suspension detected — DO NOT retry. Investigate sender account state manually.");
+      }
+      if (/unauthorized|401|cookie\s+expired|session\s+expired|jwt.*expired/.test(allErrors)) {
+        patternHints.push("Auth/cookie issues detected — sender's LinkedIn session likely expired. Refresh cookies via cloud browser.");
+      }
+      if (/timeout\b|timed\s*out/.test(allErrors)) {
+        patternHints.push("Timeout errors detected — backend or LinkedIn response slow. Could be transient (safe to retry) or proxy slowness (investigate).");
+      }
+      if (byErrCodeArr.find((b) => b.value === "replied" && b.count > 0)) {
+        patternHints.push("Some tasks have automation_error_code='replied' — these are leads that responded. NEVER retry replied tasks. The bulk_retry tool already excludes them.");
+      }
+      if (byErrCodeArr.find((b) => b.value === "unclassified" && b.count > 0)) {
+        patternHints.push("Some failures are unclassified by backend (null automation_error_code). The error_msg samples below may reveal patterns. Use include_unclassified=true with restart_failed_tasks to retry these.");
+      }
+
+      const bySenderEnriched = bySenderArr.map((b) => ({
+        sender_profile_uuid: b.value,
+        sender_name: senderNames[b.value] ?? b.value,
+        count: b.count,
+      }));
+
+      return jsonResult({
+        period,
+        status,
+        scope: {
+          flow_uuid: params.flow_uuid ?? null,
+          sender_profile_uuid: params.sender_profile_uuid ?? null,
+          since,
+          include_internal: includeInternal,
+        },
+        by_error_code: byErrCodeArr,
+        by_sender: bySenderEnriched,
+        samples,
+        pattern_hints: patternHints,
+        samples_count: samples.length,
+      });
+    },
+  );
+
+  // Shared filter builder for restart/skip/restart-from-top
+  function buildTaskTriageFilter(p: {
+    flow_uuid?: string;
+    sender_profile_uuid?: string;
+    period?: "24h" | "7d" | "30d";
+    automation_error_code?: string;
+    include_unclassified?: boolean;
+    task_uuids?: string[];
+  }): Record<string, unknown> {
+    const periodMs: Record<string, number> = {
+      "24h": 24 * 60 * 60 * 1000,
+      "7d": 7 * 24 * 60 * 60 * 1000,
+      "30d": 30 * 24 * 60 * 60 * 1000,
+    };
+    const period = p.period ?? "24h";
+    const since = new Date(Date.now() - periodMs[period]).toISOString();
+    const filter: Record<string, unknown> = {
+      status: "failed",
+      schedule_at: { ">=": since },
+    };
+    if (p.flow_uuid) filter.flow_uuid = p.flow_uuid;
+    if (p.sender_profile_uuid) filter.sender_profile_uuid = p.sender_profile_uuid;
+    if (p.automation_error_code) {
+      filter.automation_error_code = p.automation_error_code;
+    } else if (!(p.include_unclassified ?? false)) {
+      filter.automation_error_code = ["too_many_attempts", "unknown"];
+    }
+    if (p.task_uuids && p.task_uuids.length > 0) {
+      filter.id = p.task_uuids;
+    }
+    return filter;
+  }
+
+  server.tool(
+    "restart_failed_tasks",
+    "Bulk-retry failed automation tasks using a filter (or explicit task UUIDs). Re-queues matching tasks to run again from where they failed; status: failed → restarted → in_progress. Hard-coded skip: 'replied' (lead has responded — never retry). Use diagnose_failed_tasks FIRST to confirm there's something retryable. Pass dry_run:true to preview matched_count without mutation. include_unclassified:true catches NULL automation_error_code (workaround for backend classifier gap).",
+    {
+      flow_uuid: z.string().optional().describe("Scope to one automation"),
+      sender_profile_uuid: z.string().optional().describe("Scope to one sender"),
+      period: z.enum(["24h", "7d", "30d"]).optional().describe("Lookback window (default 24h)"),
+      automation_error_code: z.enum(["too_many_attempts", "unknown", "replied"]).optional().describe("Filter to specific error code"),
+      include_unclassified: z.boolean().optional().describe("If true, catch tasks with NULL automation_error_code. Workaround for backend gap. Safe — status:'failed' alone never includes 'replied' tasks (those are canceled). Default false."),
+      task_uuids: z.array(z.string()).optional().describe("Explicit task UUIDs to retry. Overrides filter."),
+      dry_run: z.boolean().optional().describe("If true, only count what would be retried — no mutation."),
+    },
+    { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
+    async (params) => {
+      const filter = buildTaskTriageFilter(params);
+
+      if (params.dry_run) {
+        try {
+          const counts = await grinfiRequest("POST", "/flows/api/tasks/group-counts", {
+            filter,
+            group_field: "type",
+          }) as Record<string, unknown>;
+          let total = 0;
+          for (const v of Object.values(counts)) {
+            if (typeof v === "number") total += v;
+          }
+          return jsonResult({
+            dry_run: true,
+            matched_count: total,
+            filter,
+            note: "No mutation performed. Run without dry_run to actually retry.",
+          });
+        } catch (err) {
+          return jsonResult({
+            dry_run: true,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+
+      const result = await grinfiRequest("PUT", "/flows/api/tasks/mass-retry", { filter });
+      return jsonResult({ result, filter });
+    },
+  );
+
+  server.tool(
+    "skip_failed_tasks",
+    "Bulk-skip failed automation tasks: lead PROGRESSES to next node without re-executing the failed step (status: failed → skipped). Use when failure isn't worth retrying (data quality issue, optional webhook node, etc.) and you just want the lead to continue. UI equivalent: 'Skip' button on failed-task modal. ⚠ STATE MUTATION — leads progress through their flow. Pair with diagnose_failed_tasks first; pass dry_run:true to preview.",
+    {
+      flow_uuid: z.string().optional(),
+      sender_profile_uuid: z.string().optional(),
+      period: z.enum(["24h", "7d", "30d"]).optional(),
+      automation_error_code: z.enum(["too_many_attempts", "unknown", "replied"]).optional(),
+      include_unclassified: z.boolean().optional(),
+      task_uuids: z.array(z.string()).optional().describe("Explicit task UUIDs to skip"),
+      dry_run: z.boolean().optional(),
+    },
+    { readOnlyHint: false, destructiveHint: true, idempotentHint: false },
+    async (params) => {
+      const filter = buildTaskTriageFilter(params);
+      if (params.dry_run) {
+        try {
+          const counts = await grinfiRequest("POST", "/flows/api/tasks/group-counts", { filter, group_field: "type" }) as Record<string, unknown>;
+          let total = 0;
+          for (const v of Object.values(counts)) if (typeof v === "number") total += v;
+          return jsonResult({ dry_run: true, matched_count: total, filter, note: "No mutation. Run without dry_run to actually skip." });
+        } catch (err) {
+          return jsonResult({ dry_run: true, error: err instanceof Error ? err.message : String(err) });
+        }
+      }
+      const result = await grinfiRequest("PUT", "/flows/api/tasks/mass-skip", { filter });
+      return jsonResult({ result, filter });
+    },
+  );
+
+  server.tool(
+    "restart_failed_tasks_from_top",
+    "Re-enrol matched leads from the START of a flow (node 1), bypassing the failed task position. Optionally swap to a different sender via new_sender_profile_uuid. UI equivalent: 'Restart from top' on failed-task modal. ⚠ MAJOR STATE MUTATION — leads will receive initial flow messages again (including connection requests/initial emails). Treat as fresh enrolment. ALWAYS use dry_run:true first; ALWAYS confirm with user before running for-real.",
+    {
+      flow_uuid: z.string().describe("Flow UUID to restart leads in (REQUIRED)"),
+      sender_profile_uuid: z.string().optional().describe("Optional: scope to leads currently on this sender"),
+      period: z.enum(["24h", "7d", "30d"]).optional(),
+      automation_error_code: z.enum(["too_many_attempts", "unknown", "replied"]).optional(),
+      include_unclassified: z.boolean().optional(),
+      new_sender_profile_uuid: z.string().optional().describe("If provided, leads restart on this sender instead of their original."),
+      dry_run: z.boolean().optional(),
+    },
+    { readOnlyHint: false, destructiveHint: true, idempotentHint: false },
+    async (params) => {
+      const filter = buildTaskTriageFilter({
+        flow_uuid: params.flow_uuid,
+        sender_profile_uuid: params.sender_profile_uuid,
+        period: params.period,
+        automation_error_code: params.automation_error_code,
+        include_unclassified: params.include_unclassified,
+      });
+      if (params.dry_run) {
+        try {
+          const counts = await grinfiRequest("POST", "/flows/api/tasks/group-counts", { filter, group_field: "type" }) as Record<string, unknown>;
+          let total = 0;
+          for (const v of Object.values(counts)) if (typeof v === "number") total += v;
+          return jsonResult({
+            dry_run: true,
+            matched_count: total,
+            filter,
+            warning: "Each matched lead will receive initial flow messages AGAIN. Treat as fresh enrolment.",
+          });
+        } catch (err) {
+          return jsonResult({ dry_run: true, error: err instanceof Error ? err.message : String(err) });
+        }
+      }
+      const body: Record<string, unknown> = {
+        filter,
+        flow_uuid: params.flow_uuid,
+        flow_origin: "automation",
+        new_contact_source_id: 1,
+      };
+      if (params.new_sender_profile_uuid) body.sender_profile_uuid = params.new_sender_profile_uuid;
+      const result = await grinfiRequest("PUT", "/flows/api/tasks/mass-restart-from-top", body);
+      return jsonResult({ result, body });
+    },
+  );
+
   // --- Multi-team tools (only registered when GRINFI_TEAM_KEYS is set) ---
 
   if (teamKeys.length > 0) {
