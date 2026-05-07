@@ -3286,6 +3286,69 @@ function createMcpServer(): McpServer {
     return jsonResult(result);
   });
 
+  // ===========================
+  // DATA SOURCES (LinkedIn import jobs)
+  // ===========================
+
+  server.tool("list_data_sources", "List LinkedIn import jobs (data sources) with pagination.", {
+    limit: z.number().optional(), offset: z.number().optional(),
+    order_field: z.string().optional(), order_type: z.enum(["asc", "desc"]).optional(),
+  },
+    { readOnlyHint: true, destructiveHint: false },
+    async (params) => {
+    const result = await grinfiRequest("GET", "/leads/api/data-sources", undefined, buildQuery(params));
+    return jsonResult(result);
+  });
+
+  server.tool("get_data_source", "Get a data source (LinkedIn import job) by UUID.", {
+    uuid: z.string().describe("UUID of the data source"),
+  },
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async (params) => {
+    const result = await grinfiRequest("GET", `/leads/api/data-sources/${params.uuid}`);
+    return jsonResult(result);
+  });
+
+  server.tool("create_data_source", "Create a new LinkedIn import job. Imports contacts from LinkedIn searches, lists, or Sales Navigator into a contact list.", {
+    type: z.enum(["csv_leads", "sn_leads_search", "sn_leads_saved_search", "sn_leads_list", "sn_accounts_search", "sn_accounts_saved_search", "sn_accounts_list", "ln_leads_search", "ln_accounts_search", "ln_my_network", "ln_my_messenger", "post_engagement", "recruiter_leads_search"]).describe("Type of import source"),
+    list_uuid: z.string().describe("UUID of the contact list to import into"),
+    payload: z.record(z.string(), z.unknown()).optional().describe("Import configuration specific to the data source type"),
+    tags: z.array(z.string()).optional().describe("Tags to apply to imported contacts"),
+  },
+    { readOnlyHint: false, destructiveHint: false },
+    async (params) => {
+    const body: Record<string, unknown> = { type: params.type, list_uuid: params.list_uuid };
+    if (params.payload) body.payload = params.payload;
+    if (params.tags) body.tags = params.tags;
+    const result = await grinfiRequest("POST", "/leads/api/data-sources", body);
+    return jsonResult(result);
+  });
+
+  server.tool("update_data_source", "Update a data source by UUID.", {
+    uuid: z.string().describe("UUID of the data source"),
+    type: z.string().optional(),
+    list_uuid: z.string().optional(),
+    payload: z.record(z.string(), z.unknown()).optional(),
+    tags: z.array(z.string()).nullable().optional(),
+  },
+    { readOnlyHint: false, destructiveHint: false },
+    async (params) => {
+    const { uuid, ...fields } = params;
+    const body: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(fields)) { if (v !== undefined) body[k] = v; }
+    const result = await grinfiRequest("PUT", `/leads/api/data-sources/${uuid}`, body);
+    return jsonResult(result);
+  });
+
+  server.tool("delete_data_source", "Delete a data source (import job) by UUID.", {
+    uuid: z.string().describe("UUID of the data source to delete"),
+  },
+    { readOnlyHint: false, destructiveHint: true },
+    async (params) => {
+    const result = await grinfiRequest("DELETE", `/leads/api/data-sources/${params.uuid}`);
+    return jsonResult(result);
+  });
+
   // --- Multi-team tools (only registered when GRINFI_TEAM_KEYS is set) ---
 
   if (teamKeys.length > 0) {
