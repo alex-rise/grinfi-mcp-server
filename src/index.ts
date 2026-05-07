@@ -2522,6 +2522,611 @@ function createMcpServer(): McpServer {
     },
   );
 
+  // ===========================
+  // WORKSPACE HEALTH CHECK & DASHBOARD
+  // ===========================
+
+  server.tool(
+    "workspace_health_check",
+    "Single-call workspace dashboard — operational overview in one tool call. Returns 6 sections: 1) today (sends/replies counts per type), 2) yesterday (same shape), 3) linkedin_health (browser fleet status, cookies, daily caps), 4) email_health (mailboxes status + errors), 5) active_flows (running automations with in-progress task counts), 6) failed_tasks (failed counts today/yesterday/7d by task type). All sections fetched in parallel for speed. Pass dry_run:true to drop detail rows and only return aggregated counters.",
+    {
+      dry_run: z.boolean().optional().describe("If true, return only summary counters (no per-browser/per-mailbox/per-flow detail rows)"),
+    },
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async (params) => {
+      const dry = params.dry_run ?? false;
+      const now = Date.now();
+      const todayStart = new Date(now);
+      todayStart.setUTCHours(0, 0, 0, 0);
+      const yesterdayStart = new Date(todayStart.getTime() - 24 * 60 * 60 * 1000);
+      const sevenDaysAgo = new Date(now - 7 * 24 * 60 * 60 * 1000);
+
+      const todayIso = todayStart.toISOString();
+      const yesterdayIso = yesterdayStart.toISOString();
+      const sevenDaysAgoIso = sevenDaysAgo.toISOString();
+
+      const internalTypes = ["util_timer", "trigger_message_replied", "trigger_completed", "trigger_paused"];
+
+      async function fetchCounts(filter: Record<string, unknown>, groupField: string): Promise<{ value: string; count: number }[]> {
+        try {
+          const res = await grinfiRequest("POST", "/flows/api/tasks/group-counts", { filter, group_field: groupField }) as Record<string, unknown>;
+          const arr: { value: string; count: number }[] = [];
+          for (const [k, v] of Object.entries(res)) {
+            if (typeof v === "number") arr.push({ value: k === "" ? "(unset)" : k, count: v });
+          }
+          if (arr.length === 0 && Array.isArray(res.data)) {
+            return (res.data as { value: string; count: number }[]);
+          }
+          return arr;
+        } catch {
+          return [];
+        }
+      }
+
+      const [
+        todayCompletedByType,
+        yesterdayCompletedByType,
+        browsersResult,
+        mailboxesResult,
+        flowsResult,
+        failedToday,
+        failedYesterday,
+        failed7d,
+      ] = await Promise.all([
+        fetchCounts({
+          status: "closed",
+          schedule_at: { ">=": todayIso },
+          type: { "!=": internalTypes },
+        }, "type"),
+        fetchCounts({
+          status: "closed",
+          schedule_at: { ">=": yesterdayIso, "<": todayIso },
+          type: { "!=": internalTypes },
+        }, "type"),
+        grinfiRequest("POST", "/browsers/api/linkedin-browsers/list", { limit: 100, offset: 0 }).catch(() => ({ data: [] })),
+        grinfiRequest("GET", "/emails/api/mailboxes", undefined, { limit: "100" }).catch(() => ({ data: [] })),
+        grinfiRequest("POST", "/flows/api/flows/list", { limit: 100, offset: 0, filter: { status: "in_progress" } }).catch(() => ({ data: [] })),
+        fetchCounts({
+          status: "failed",
+          schedule_at: { ">=": todayIso },
+          type: { "!=": internalTypes },
+        }, "type"),
+        fetchCounts({
+          status: "failed",
+          schedule_at: { ">=": yesterdayIso, "<": todayIso },
+          type: { "!=": internalTypes },
+        }, "type"),
+        fetchCounts({
+          status: "failed",
+          schedule_at: { ">=": sevenDaysAgoIso },
+          type: { "!=": internalTypes },
+        }, "type"),
+      ]);
+
+      function aggregateActivity(byType: { value: string; count: number }[]): Record<string, number> {
+        const agg: Record<string, number> = {
+          messages_sent: 0,
+          connect_requests_sent: 0,
+          inmails_sent: 0,
+          emails_sent: 0,
+          tasks_completed_total: 0,
+        };
+        for (const e of byType) {
+          agg.tasks_completed_total += e.count;
+          if (e.value === "linkedin_send_message") agg.messages_sent += e.count;
+          else if (e.value === "linkedin_send_connection_request") agg.connect_requests_sent += e.count;
+          else if (e.value === "linkedin_send_inmail") agg.inmails_sent += e.count;
+          else if (e.value === "gs_send_email") agg.emails_sent += e.count;
+        }
+        return agg;
+      }
+
+      const today = aggregateActivity(todayCompletedByType);
+      const yesterday = aggregateActivity(yesterdayCompletedByType);
+
+      const browsers = Array.isArray((browsersResult as { data?: unknown }).data) ? (browsersResult as { data: Record<string, unknown>[] }).data : [];
+      const linkedinHealth = {
+        total_browsers: browsers.length,
+        active: browsers.filter((b) => b.status === "active").length,
+        paused: browsers.filter((b) => b.status === "paused").length,
+        banned: browsers.filter((b) => b.status === "banned").length,
+        cookie_expired: browsers.filter((b) => b.cookie_status === "expired" || b.cookie_status === "invalid").length,
+        capacity_remaining: browsers.reduce((sum, b) => sum + Math.max(0, ((b.daily_limit as number) ?? 0) - ((b.usage_today as number) ?? 0)), 0),
+        details: dry ? null : browsers.map((b) => ({
+          id: b.id,
+          name: b.name ?? b.email ?? null,
+          status: b.status,
+          cookie_status: b.cookie_status,
+          health_score: b.health_score,
+          remaining_today: Math.max(0, ((b.daily_limit as number) ?? 0) - ((b.usage_today as number) ?? 0)),
+        })),
+      };
+
+      const mailboxes = Array.isArray((mailboxesResult as { data?: unknown }).data) ? (mailboxesResult as { data: Record<string, unknown>[] }).data : [];
+      const emailHealth = {
+        total_mailboxes: mailboxes.length,
+        active: mailboxes.filter((m) => m.send_status === "active").length,
+        sync_errors: mailboxes.filter((m) => ((m.sync_errors_count as number) ?? 0) > 0).length,
+        send_errors: mailboxes.filter((m) => ((m.send_errors_count as number) ?? 0) > 0).length,
+        details: dry ? null : mailboxes.map((m) => ({
+          uuid: m.uuid,
+          email: m.email,
+          send_status: m.send_status,
+          sync_status: m.sync_status,
+          send_errors_count: m.send_errors_count,
+          sync_errors_count: m.sync_errors_count,
+          last_send_at: m.last_send_at,
+        })),
+      };
+
+      const flows = Array.isArray((flowsResult as { data?: unknown }).data) ? (flowsResult as { data: Record<string, unknown>[] }).data : [];
+      const activeFlows = {
+        total: flows.length,
+        details: dry ? null : flows.map((f) => ({
+          uuid: f.uuid,
+          name: f.name,
+          status: f.status,
+          created_at: f.created_at,
+        })),
+      };
+
+      const failedSummary = {
+        today_total: failedToday.reduce((s, e) => s + e.count, 0),
+        yesterday_total: failedYesterday.reduce((s, e) => s + e.count, 0),
+        last_7d_total: failed7d.reduce((s, e) => s + e.count, 0),
+        last_7d_by_type: dry ? null : failed7d.sort((a, b) => b.count - a.count).slice(0, 10),
+      };
+
+      return jsonResult({
+        timestamp: new Date().toISOString(),
+        today,
+        yesterday,
+        linkedin_health: linkedinHealth,
+        email_health: emailHealth,
+        active_flows: activeFlows,
+        failed_tasks: failedSummary,
+      });
+    },
+  );
+
+  server.tool(
+    "get_dashboard",
+    "Fetch a CRM analytics widget (composite from existing metrics endpoints). Supported widget_type values: activities_over_time (sends/replies per day or week), conversion_funnel (lead counts per pipeline stage), pipeline_distribution (same as funnel but as percentages), sender_performance (per-sender event totals), response_rate (replies / sent ratio per sender or overall). Use for dashboard/report/summary questions. Use search_contacts for row-level data.",
+    {
+      widget_type: z.enum(["activities_over_time", "pipeline_distribution", "conversion_funnel", "sender_performance", "response_rate"]).describe("Widget type"),
+      period_from: z.string().optional().describe("Start date ISO (default: 30 days ago)"),
+      period_to: z.string().optional().describe("End date ISO (default: now)"),
+      flow_uuids: z.array(z.string()).optional().describe("Filter by flows"),
+      sender_profile_uuids: z.array(z.string()).optional().describe("Filter by senders"),
+      granularity: z.enum(["day", "week", "month"]).optional().describe("Time granularity (for activities_over_time). Default: day"),
+    },
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async (params) => {
+      const periodTo = params.period_to ?? new Date().toISOString();
+      const periodFrom = params.period_from ?? new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+
+      const baseFilter: Record<string, unknown> = {
+        schedule_at: { ">=": periodFrom, "<=": periodTo },
+      };
+      if (params.flow_uuids && params.flow_uuids.length > 0) baseFilter.flow_uuid = params.flow_uuids;
+      if (params.sender_profile_uuids && params.sender_profile_uuids.length > 0) baseFilter.sender_profile_uuid = params.sender_profile_uuids;
+
+      const internalTypes = ["util_timer", "trigger_message_replied", "trigger_completed", "trigger_paused"];
+      baseFilter.type = { "!=": internalTypes };
+
+      async function fetchCounts(filter: Record<string, unknown>, groupField: string): Promise<{ value: string; count: number }[]> {
+        try {
+          const res = await grinfiRequest("POST", "/flows/api/tasks/group-counts", { filter, group_field: groupField }) as Record<string, unknown>;
+          const arr: { value: string; count: number }[] = [];
+          for (const [k, v] of Object.entries(res)) {
+            if (typeof v === "number") arr.push({ value: k === "" ? "(unset)" : k, count: v });
+          }
+          return arr;
+        } catch {
+          return [];
+        }
+      }
+
+      switch (params.widget_type) {
+        case "activities_over_time": {
+          const granularity = params.granularity ?? "day";
+          const filter = { ...baseFilter, status: "closed" };
+          const buckets = await fetchCounts(filter, granularity);
+          const sortedBuckets = buckets.sort((a, b) => a.value.localeCompare(b.value));
+          return jsonResult({
+            widget: "activities_over_time",
+            period_from: periodFrom,
+            period_to: periodTo,
+            granularity,
+            total: sortedBuckets.reduce((s, b) => s + b.count, 0),
+            series: sortedBuckets.map((b) => ({ date: b.value, count: b.count })),
+          });
+        }
+
+        case "pipeline_distribution":
+        case "conversion_funnel": {
+          const stages = await grinfiRequest("GET", "/leads/api/pipeline-stages") as { data?: Record<string, unknown>[] };
+          const stageList = Array.isArray(stages.data) ? stages.data : [];
+          const leadStages = stageList.filter((s) => s.object_type === "lead").sort((a, b) => ((a.order as number) ?? 0) - ((b.order as number) ?? 0));
+
+          const counts = await Promise.all(
+            leadStages.map(async (stage) => {
+              try {
+                const r = await grinfiRequest("POST", "/leads/api/leads/count", { filter: { pipeline_stage_uuid: stage.uuid } }) as Record<string, unknown>;
+                const count = (r.count as number | undefined) ?? (r.total as number | undefined) ?? 0;
+                return { stage_uuid: stage.uuid as string, name: stage.name as string, category: stage.category as string, order: stage.order as number, count };
+              } catch {
+                return { stage_uuid: stage.uuid as string, name: stage.name as string, category: stage.category as string, order: stage.order as number, count: 0 };
+              }
+            }),
+          );
+
+          const total = counts.reduce((s, c) => s + c.count, 0);
+
+          if (params.widget_type === "pipeline_distribution") {
+            return jsonResult({
+              widget: "pipeline_distribution",
+              total,
+              stages: counts.map((c) => ({
+                ...c,
+                pct: total > 0 ? Math.round((c.count / total) * 1000) / 10 : 0,
+              })),
+            });
+          } else {
+            const stagesWithConv = counts.map((c, i) => {
+              const prev = i > 0 ? counts[i - 1].count : 0;
+              const conversionPctFromPrev = i > 0 && prev > 0 ? Math.round((c.count / prev) * 1000) / 10 : null;
+              return { ...c, conversion_pct_from_prev: conversionPctFromPrev };
+            });
+            return jsonResult({
+              widget: "conversion_funnel",
+              total_leads: total,
+              stages: stagesWithConv,
+            });
+          }
+        }
+
+        case "sender_performance": {
+          const filter = { ...baseFilter, status: "closed" };
+          const bySender = await fetchCounts(filter, "sender_profile_uuid");
+          const senderInfo: Record<string, string> = {};
+          await Promise.all(
+            bySender.map(async (s) => {
+              try {
+                const r = await grinfiRequest("GET", `/flows/api/sender-profiles/${s.value}`) as { name?: string; email?: string };
+                senderInfo[s.value] = r.name ?? r.email ?? s.value;
+              } catch {
+                senderInfo[s.value] = s.value;
+              }
+            }),
+          );
+          const sorted = bySender.sort((a, b) => b.count - a.count);
+          const total = sorted.reduce((s, e) => s + e.count, 0);
+          return jsonResult({
+            widget: "sender_performance",
+            period_from: periodFrom,
+            period_to: periodTo,
+            total,
+            senders: sorted.map((s) => ({
+              sender_profile_uuid: s.value,
+              sender_name: senderInfo[s.value] ?? s.value,
+              count: s.count,
+              pct: total > 0 ? Math.round((s.count / total) * 1000) / 10 : 0,
+            })),
+          });
+        }
+
+        case "response_rate": {
+          const sentFilter = {
+            ...baseFilter,
+            status: "closed",
+            type: ["linkedin_send_message", "linkedin_send_connection_request", "linkedin_send_inmail", "gs_send_email"],
+          };
+          const repliedFilter = {
+            ...baseFilter,
+            status: "canceled",
+            automation_error_code: "replied",
+          };
+          const [sentBySender, repliedBySender] = await Promise.all([
+            fetchCounts(sentFilter, "sender_profile_uuid"),
+            fetchCounts(repliedFilter, "sender_profile_uuid"),
+          ]);
+          const sentMap = new Map(sentBySender.map((s) => [s.value, s.count]));
+          const repliedMap = new Map(repliedBySender.map((s) => [s.value, s.count]));
+          const allSenders = Array.from(new Set([...sentMap.keys(), ...repliedMap.keys()]));
+
+          const senderInfo: Record<string, string> = {};
+          await Promise.all(
+            allSenders.map(async (uuid) => {
+              try {
+                const r = await grinfiRequest("GET", `/flows/api/sender-profiles/${uuid}`) as { name?: string; email?: string };
+                senderInfo[uuid] = r.name ?? r.email ?? uuid;
+              } catch {
+                senderInfo[uuid] = uuid;
+              }
+            }),
+          );
+
+          const senders = allSenders.map((uuid) => {
+            const sent = sentMap.get(uuid) ?? 0;
+            const replied = repliedMap.get(uuid) ?? 0;
+            const rate = sent > 0 ? Math.round((replied / sent) * 1000) / 10 : 0;
+            return { sender_profile_uuid: uuid, sender_name: senderInfo[uuid] ?? uuid, sent, replied, response_rate_pct: rate };
+          }).sort((a, b) => b.response_rate_pct - a.response_rate_pct);
+
+          const totalSent = senders.reduce((s, e) => s + e.sent, 0);
+          const totalReplied = senders.reduce((s, e) => s + e.replied, 0);
+          return jsonResult({
+            widget: "response_rate",
+            period_from: periodFrom,
+            period_to: periodTo,
+            overall: {
+              sent: totalSent,
+              replied: totalReplied,
+              response_rate_pct: totalSent > 0 ? Math.round((totalReplied / totalSent) * 1000) / 10 : 0,
+            },
+            by_sender: senders,
+          });
+        }
+
+        default: {
+          return jsonResult({ error: `Unknown widget_type: ${params.widget_type}` });
+        }
+      }
+    },
+  );
+
+  server.tool(
+    "send_volume_report",
+    "Count outreach EVENTS (tasks) over a period with flexible group_by. Use cases: 'how many messages sent last week?', 'connect requests per sender', 'sends per day per flow'. DIFFERS from workspace_health_check (which is operational today/yesterday): this is period-aware reporting with group_by flexibility. When group_by='type', task type names are remapped to user-friendly form (linkedin_send_message → messages_sent, linkedin_send_connection_request → connect_requests_sent, gs_send_email → emails_sent). Internal types (util_timer, trigger_*) excluded by default. Each entry includes pct_of_total.",
+    {
+      period: z.enum(["24h", "7d", "30d", "90d"]).optional().describe("Lookback window (default '7d')"),
+      group_by: z.enum(["type", "status", "flow_uuid", "sender_profile_uuid", "mailbox_uuid", "day", "week"]).optional().describe("Grouping field (default 'type')"),
+      flow_uuid: z.string().optional().describe("Optional: scope to one automation"),
+      sender_profile_uuid: z.string().optional().describe("Optional: scope to one sender"),
+      include_internal: z.boolean().optional().describe("Include util_timer/trigger_* task types (default false)"),
+      status: z.enum(["closed", "failed", "canceled", "in_progress", "all"]).optional().describe("Task status filter (default 'closed' = completed events)"),
+    },
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async (params) => {
+      const periodMs: Record<string, number> = {
+        "24h": 24 * 60 * 60 * 1000,
+        "7d": 7 * 24 * 60 * 60 * 1000,
+        "30d": 30 * 24 * 60 * 60 * 1000,
+        "90d": 90 * 24 * 60 * 60 * 1000,
+      };
+      const period = params.period ?? "7d";
+      const since = new Date(Date.now() - periodMs[period]).toISOString();
+      const groupBy = params.group_by ?? "type";
+
+      const filter: Record<string, unknown> = {
+        schedule_at: { ">=": since },
+      };
+      if (params.status && params.status !== "all") {
+        filter.status = params.status;
+      } else if (!params.status) {
+        filter.status = "closed";
+      }
+      if (params.flow_uuid) filter.flow_uuid = params.flow_uuid;
+      if (params.sender_profile_uuid) filter.sender_profile_uuid = params.sender_profile_uuid;
+
+      const internalTypes = ["util_timer", "trigger_message_replied", "trigger_completed", "trigger_paused"];
+      if (!(params.include_internal ?? false)) {
+        filter.type = { "!=": internalTypes };
+      }
+
+      const groupCounts = await grinfiRequest("POST", "/flows/api/tasks/group-counts", {
+        filter,
+        group_field: groupBy,
+      }) as Record<string, unknown>;
+
+      const entries: { value: string; count: number }[] = [];
+      for (const [k, v] of Object.entries(groupCounts)) {
+        if (typeof v === "number") {
+          entries.push({ value: k === "" ? "(unset)" : k, count: v });
+        }
+      }
+      if (entries.length === 0 && Array.isArray((groupCounts as { data?: unknown }).data)) {
+        const arr = (groupCounts as { data: { value: string; count: number }[] }).data;
+        entries.push(...arr);
+      }
+
+      const total = entries.reduce((sum, e) => sum + e.count, 0);
+
+      const typeFriendlyNames: Record<string, string> = {
+        linkedin_send_message: "messages_sent",
+        linkedin_send_connection_request: "connect_requests_sent",
+        linkedin_send_inmail: "inmails_sent",
+        linkedin_view_profile: "profile_views",
+        linkedin_send_post_engagement: "post_engagements",
+        gs_send_email: "emails_sent",
+        gs_add_tag: "tags_assigned",
+        gs_remove_tag: "tags_removed",
+        gs_change_pipeline_stage: "pipeline_stage_changes",
+        gs_add_to_list: "list_additions",
+        gs_run_ai_agent: "ai_agent_runs",
+        gs_phone_call: "phone_calls",
+        gs_custom_action: "custom_actions",
+      };
+
+      const enriched = entries
+        .sort((a, b) => b.count - a.count)
+        .map((e) => {
+          const friendlyKey = groupBy === "type" ? (typeFriendlyNames[e.value] ?? e.value) : e.value;
+          return {
+            key: friendlyKey,
+            raw_key: e.value,
+            count: e.count,
+            pct_of_total: total > 0 ? Math.round((e.count / total) * 1000) / 10 : 0,
+          };
+        });
+
+      return jsonResult({
+        period,
+        since,
+        group_by: groupBy,
+        scope: {
+          flow_uuid: params.flow_uuid ?? null,
+          sender_profile_uuid: params.sender_profile_uuid ?? null,
+          status: filter.status,
+          include_internal: params.include_internal ?? false,
+        },
+        total,
+        groups: enriched,
+      });
+    },
+  );
+
+  server.tool(
+    "diagnose_mailbox",
+    "Run a deep health diagnosis on a single mailbox by UUID. Returns send/sync status, connection settings (host:port masked-password), proxy info, error counts, last activity timestamps, automation daily_limit + interval, plus a list of detected issues (send_status=error, sync_errors over threshold, no activity for 24h+, etc.) and recommendations. Use to investigate why a mailbox is failing; for the listing of all mailboxes use list_mailboxes, for raw error list use list_mailbox_errors.",
+    {
+      uuid: z.string().describe("UUID of the mailbox to diagnose"),
+    },
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async (params) => {
+      const mailbox = await grinfiRequest("GET", `/emails/api/mailboxes/${params.uuid}`) as Record<string, unknown>;
+      const cs = mailbox.connection_settings as Record<string, Record<string, unknown>> | undefined;
+      const masked = cs ? {
+        send: cs.send ? { ...cs.send, password: cs.send.password ? "***MASKED***" : null } : null,
+        sync: cs.sync ? { ...cs.sync, password: cs.sync.password ? "***MASKED***" : null } : null,
+      } : null;
+      const proxy = mailbox.proxy_settings as Record<string, unknown> | null | undefined;
+      const maskedProxy = proxy ? { ...proxy, password: proxy.password ? "***MASKED***" : null } : null;
+
+      const sendStatus = mailbox.send_status as string;
+      const syncStatus = mailbox.sync_status as string;
+      const sendErrors = (mailbox.send_errors_count as number | undefined) ?? 0;
+      const syncErrors = (mailbox.sync_errors_count as number | undefined) ?? 0;
+      const lastSendAt = mailbox.last_send_at as string | null | undefined;
+      const lastSyncAt = mailbox.last_sync_at as string | null | undefined;
+
+      const issues: string[] = [];
+      const recommendations: string[] = [];
+
+      if (sendStatus !== "active") {
+        issues.push(`send_status is '${sendStatus}' (expected 'active')`);
+        recommendations.push("Use update_mailbox to fix or activate_mailbox to re-enable.");
+      }
+      if (syncStatus !== "active") {
+        issues.push(`sync_status is '${syncStatus}' (expected 'active')`);
+      }
+      if (sendErrors > 5) {
+        issues.push(`${sendErrors} send errors accumulated`);
+        recommendations.push("Check list_mailbox_errors for the actual error messages. Common causes: SMTP auth failure, rate limit, blacklisted IP.");
+      }
+      if (syncErrors > 5) {
+        issues.push(`${syncErrors} sync errors accumulated`);
+        recommendations.push("IMAP sync issues — verify credentials, check 'Less secure apps' for Gmail, or app password for 2FA accounts.");
+      }
+      if (lastSendAt) {
+        const lastSendMs = new Date(lastSendAt).getTime();
+        const hoursSince = (Date.now() - lastSendMs) / (1000 * 60 * 60);
+        if (hoursSince > 24) {
+          issues.push(`No send activity for ${Math.round(hoursSince)}h (last send: ${lastSendAt})`);
+        }
+      } else {
+        issues.push("Mailbox has never sent any email (last_send_at is null)");
+      }
+      if (!lastSyncAt) {
+        issues.push("Mailbox has never synced (last_sync_at is null) — likely connection problem on initial setup");
+      }
+      if (issues.length === 0) {
+        issues.push("No issues detected. Mailbox appears healthy.");
+      }
+
+      return jsonResult({
+        uuid: mailbox.uuid,
+        email: mailbox.email,
+        provider: mailbox.provider,
+        sender_name: mailbox.sender_name,
+        send_status: sendStatus,
+        sync_status: syncStatus,
+        send_errors_count: sendErrors,
+        sync_errors_count: syncErrors,
+        last_send_at: lastSendAt,
+        last_sync_at: lastSyncAt,
+        automation_daily_limit: mailbox.automation_daily_limit,
+        automation_task_interval: mailbox.automation_task_interval,
+        connection_settings: masked,
+        proxy_settings: maskedProxy,
+        sender_profile_uuid: mailbox.sender_profile_uuid,
+        team_id: mailbox.team_id,
+        issues,
+        recommendations,
+        is_healthy: sendStatus === "active" && syncStatus === "active" && sendErrors <= 5 && syncErrors <= 5,
+      });
+    },
+  );
+
+  server.tool(
+    "get_health_snapshots",
+    "Fleet-wide health snapshot of all LinkedIn sending accounts in one call. Returns each browser with status (active/paused/banned/etc.), cookie_status (valid/expired), health_score, daily_limit + usage today, last_run_at, proxy info. Use for morning triage or fleet overview without making N separate get_linkedin_browser calls. For deep single-account diagnosis use diagnose_linkedin_browser, for per-account limits-only check use check_linkedin_limits (alias).",
+    {
+      limit: z.number().optional().describe("Max browsers to return (default 50)"),
+      include_paused: z.boolean().optional().describe("Include browsers with status=paused (default true)"),
+    },
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async (params) => {
+      const body: Record<string, unknown> = {
+        limit: params.limit ?? 50,
+        offset: 0,
+      };
+      const result = await grinfiRequest("POST", "/browsers/api/linkedin-browsers/list", body) as Record<string, unknown>;
+      const browsers = Array.isArray(result.data) ? result.data as Record<string, unknown>[] : [];
+
+      const filtered = (params.include_paused ?? true) ? browsers : browsers.filter((b) => b.status !== "paused");
+
+      const snapshots = filtered.map((b) => {
+        const dailyLimit = (b.daily_limit as number | undefined) ?? null;
+        const usageToday = (b.usage_today as number | undefined) ?? null;
+        const remaining = dailyLimit !== null && usageToday !== null ? Math.max(0, dailyLimit - usageToday) : null;
+        return {
+          id: b.id,
+          uuid: b.uuid,
+          name: b.name ?? b.email ?? null,
+          status: b.status,
+          cookie_status: b.cookie_status ?? null,
+          health_score: b.health_score ?? null,
+          daily_limit: dailyLimit,
+          usage_today: usageToday,
+          remaining_today: remaining,
+          last_run_at: b.last_run_at ?? null,
+          proxy: b.proxy ?? null,
+          sender_profile_uuid: b.sender_profile_uuid ?? null,
+        };
+      });
+
+      const byStatus: Record<string, number> = {};
+      let totalUsageToday = 0;
+      let totalDailyLimit = 0;
+      for (const s of snapshots) {
+        const k = String(s.status ?? "unknown");
+        byStatus[k] = (byStatus[k] ?? 0) + 1;
+        if (typeof s.usage_today === "number") totalUsageToday += s.usage_today;
+        if (typeof s.daily_limit === "number") totalDailyLimit += s.daily_limit;
+      }
+
+      const flags: string[] = [];
+      const cookieExpired = snapshots.filter((s) => s.cookie_status === "expired").length;
+      const lowHealth = snapshots.filter((s) => typeof s.health_score === "number" && (s.health_score as number) < 50).length;
+      const overlimit = snapshots.filter((s) => s.remaining_today === 0 && (s.daily_limit ?? 0) > 0).length;
+      if (cookieExpired > 0) flags.push(`${cookieExpired} browser(s) have expired cookies — refresh via cloud browser.`);
+      if (lowHealth > 0) flags.push(`${lowHealth} browser(s) have low health score (<50). Consider diagnose_linkedin_browser for root cause.`);
+      if (overlimit > 0) flags.push(`${overlimit} browser(s) hit their daily limit. They will resume tomorrow.`);
+
+      return jsonResult({
+        total: snapshots.length,
+        by_status: byStatus,
+        usage_today_total: totalUsageToday,
+        daily_limit_total: totalDailyLimit,
+        capacity_remaining: totalDailyLimit - totalUsageToday,
+        flags,
+        snapshots,
+      });
+    },
+  );
+
   // --- Multi-team tools (only registered when GRINFI_TEAM_KEYS is set) ---
 
   if (teamKeys.length > 0) {
