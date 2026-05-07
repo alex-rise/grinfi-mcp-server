@@ -3127,6 +3127,181 @@ function createMcpServer(): McpServer {
     },
   );
 
+  // ===========================
+  // LINKEDIN BROWSERS
+  // ===========================
+
+  server.tool("list_linkedin_browsers", "List all LinkedIn browser profiles with pagination.", {
+    limit: z.number().optional(), offset: z.number().optional(),
+    order_field: z.string().optional(), order_type: z.enum(["asc", "desc"]).optional(),
+  },
+    { readOnlyHint: true, destructiveHint: false },
+    async (params) => {
+    const body: Record<string, unknown> = {};
+    if (params.limit !== undefined) body.limit = params.limit;
+    if (params.offset !== undefined) body.offset = params.offset;
+    if (params.order_field) body.order_field = params.order_field;
+    if (params.order_type) body.order_type = params.order_type;
+    const result = await grinfiRequest("POST", "/browsers/api/linkedin-browsers/list", body);
+    return jsonResult(result);
+  });
+
+  server.tool("get_linkedin_browser", "Get a LinkedIn browser profile by ID.", {
+    id: z.number().describe("LinkedIn browser ID (integer)"),
+  },
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async (params) => {
+    const result = await grinfiRequest("GET", `/browsers/api/linkedin-browsers/${params.id}`);
+    return jsonResult(result);
+  });
+
+  server.tool(
+    "diagnose_linkedin_browser",
+    "Run a deep health diagnosis on a single LinkedIn sending account (browser/seat) by ID. Returns status, cookie_status, health_score, daily_limit + usage today, last_run_at, proxy info, plus a list of detected issues (cookie expired, low health, hit daily limit, no proxy assigned, etc.) with recommendations. For lightweight fleet overview use get_health_snapshots; for proxy-only connectivity check use check_linkedin_proxy (todo).",
+    {
+      id: z.number().describe("LinkedIn browser ID (integer)"),
+    },
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async (params) => {
+      const browser = await grinfiRequest("GET", `/browsers/api/linkedin-browsers/${params.id}`) as Record<string, unknown>;
+
+      const status = browser.status as string;
+      const cookieStatus = browser.cookie_status as string | null | undefined;
+      const healthScore = browser.health_score as number | null | undefined;
+      const dailyLimit = browser.daily_limit as number | null | undefined;
+      const usageToday = browser.usage_today as number | null | undefined;
+      const lastRunAt = browser.last_run_at as string | null | undefined;
+      const proxy = browser.proxy as Record<string, unknown> | null | undefined;
+
+      const maskedProxy = proxy ? { ...proxy, password: proxy.password ? "***MASKED***" : null } : null;
+
+      const issues: string[] = [];
+      const recommendations: string[] = [];
+
+      if (status !== "active") {
+        issues.push(`status is '${status}' (expected 'active')`);
+        if (status === "banned") recommendations.push("Account banned by LinkedIn — DO NOT retry. Investigate manually, may need to retire this seat.");
+        if (status === "paused") recommendations.push("Account is paused. Use run_linkedin_browser to resume.");
+        if (status === "stopped") recommendations.push("Account stopped. Check why (manual stop, error, or rate limit).");
+      }
+      if (cookieStatus === "expired" || cookieStatus === "invalid") {
+        issues.push(`cookie_status is '${cookieStatus}' — LinkedIn session expired`);
+        recommendations.push("Use share_linkedin_browser to get cloud browser URL, log into LinkedIn, refresh cookie.");
+      }
+      if (typeof healthScore === "number" && healthScore < 50) {
+        issues.push(`health_score is ${healthScore} (low; LinkedIn limiting actions)`);
+        recommendations.push("Reduce daily activity (lower daily_limit), let account 'cool down' for 1-2 days, then resume.");
+      }
+      if (dailyLimit !== null && dailyLimit !== undefined && usageToday !== null && usageToday !== undefined) {
+        const remaining = dailyLimit - usageToday;
+        if (remaining <= 0) {
+          issues.push(`Daily limit hit (${usageToday}/${dailyLimit}). Will resume tomorrow.`);
+        } else if (remaining < 5) {
+          issues.push(`Near daily limit (${usageToday}/${dailyLimit}, only ${remaining} actions left today)`);
+        }
+      }
+      if (!maskedProxy) {
+        issues.push("No proxy assigned — direct connection from server IP. LinkedIn may detect this as suspicious.");
+        recommendations.push("Assign a residential proxy via set_linkedin_browser_proxy.");
+      }
+      if (lastRunAt) {
+        const lastRunMs = new Date(lastRunAt).getTime();
+        const hoursSince = (Date.now() - lastRunMs) / (1000 * 60 * 60);
+        if (hoursSince > 48) {
+          issues.push(`No activity for ${Math.round(hoursSince)}h (last run: ${lastRunAt})`);
+        }
+      } else {
+        issues.push("Browser has never run (last_run_at is null) — never started or stuck on initial setup");
+      }
+      if (issues.length === 0) {
+        issues.push("No issues detected. Browser appears healthy.");
+      }
+
+      return jsonResult({
+        id: browser.id,
+        uuid: browser.uuid,
+        name: browser.name ?? null,
+        email: browser.email ?? null,
+        status,
+        cookie_status: cookieStatus,
+        health_score: healthScore,
+        daily_limit: dailyLimit,
+        usage_today: usageToday,
+        remaining_today: (dailyLimit ?? 0) - (usageToday ?? 0),
+        last_run_at: lastRunAt,
+        proxy: maskedProxy,
+        sender_profile_uuid: browser.sender_profile_uuid,
+        team_id: browser.team_id,
+        issues,
+        recommendations,
+        is_healthy: status === "active" && cookieStatus !== "expired" && cookieStatus !== "invalid" && (typeof healthScore !== "number" || healthScore >= 50),
+      });
+    },
+  );
+
+  server.tool("create_linkedin_browser", "Create a new LinkedIn browser profile linked to a sender profile.", {
+    sender_profile_uuid: z.string().describe("UUID of the sender profile to link"),
+    proxy_country_code: z.string().optional().describe("Proxy country code (e.g. US, DE)"),
+  },
+    { readOnlyHint: false, destructiveHint: false },
+    async (params) => {
+    const body: Record<string, unknown> = { sender_profile_uuid: params.sender_profile_uuid };
+    if (params.proxy_country_code) body.proxy_country_code = params.proxy_country_code;
+    const result = await grinfiRequest("POST", "/browsers/api/linkedin-browsers", body);
+    return jsonResult(result);
+  });
+
+  server.tool("delete_linkedin_browser", "Delete a LinkedIn browser profile by ID. This action is irreversible.", {
+    id: z.number().describe("LinkedIn browser ID to delete"),
+  },
+    { readOnlyHint: false, destructiveHint: true },
+    async (params) => {
+    const result = await grinfiRequest("DELETE", `/browsers/api/linkedin-browsers/${params.id}`);
+    return jsonResult(result);
+  });
+
+  server.tool("run_linkedin_browser", "Start a LinkedIn browser session to begin executing queued actions.", {
+    id: z.number().describe("LinkedIn browser ID"),
+  },
+    { readOnlyHint: false, destructiveHint: false },
+    async (params) => {
+    const result = await grinfiRequest("POST", `/browsers/api/linkedin-browsers/${params.id}/run`);
+    return jsonResult(result);
+  });
+
+  server.tool("stop_linkedin_browser", "Stop a running LinkedIn browser session.", {
+    id: z.number().describe("LinkedIn browser ID"),
+  },
+    { readOnlyHint: false, destructiveHint: false },
+    async (params) => {
+    const result = await grinfiRequest("POST", `/browsers/api/linkedin-browsers/${params.id}/stop`);
+    return jsonResult(result);
+  });
+
+  server.tool("set_linkedin_browser_proxy", "Change the proxy configuration for a LinkedIn browser.", {
+    id: z.number().describe("LinkedIn browser ID"),
+    proxy_country_code: z.string().describe("Proxy country code (e.g. US, DE)"),
+  },
+    { readOnlyHint: false, destructiveHint: false },
+    async (params) => {
+    const result = await grinfiRequest("POST", `/browsers/api/linkedin-browsers/${params.id}/set-proxy`, {
+      proxy_country_code: params.proxy_country_code,
+    });
+    return jsonResult(result);
+  });
+
+  server.tool("share_linkedin_browser", "Share a LinkedIn browser profile with team members by email.", {
+    id: z.number().describe("LinkedIn browser ID"),
+    recipients: z.array(z.string()).describe("Email addresses of team members to share with"),
+  },
+    { readOnlyHint: false, destructiveHint: false },
+    async (params) => {
+    const result = await grinfiRequest("POST", `/browsers/api/linkedin-browsers/${params.id}/share`, {
+      recipients: params.recipients,
+    });
+    return jsonResult(result);
+  });
+
   // --- Multi-team tools (only registered when GRINFI_TEAM_KEYS is set) ---
 
   if (teamKeys.length > 0) {
