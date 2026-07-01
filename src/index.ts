@@ -129,13 +129,18 @@ async function grinfiUpload(
   fieldName = "file",
   filename?: string,
   extraFields?: Record<string, string>,
+  mimeType?: string,
 ): Promise<unknown> {
   const buffer = await readFile(filePath);
   const formData = new FormData();
   // Buffer is Uint8Array-compatible; cast for stricter @types/node Blob signature.
+  // When mimeType is provided, type the Blob so the multipart part carries the
+  // right Content-Type (e.g. text/csv) — some backends validate the uploaded
+  // file's MIME against an allowlist. Existing callers pass no mimeType and keep
+  // the prior behavior (typeless Blob → application/octet-stream).
   formData.append(
     fieldName,
-    new Blob([buffer as unknown as BlobPart]),
+    new Blob([buffer as unknown as BlobPart], mimeType ? { type: mimeType } : undefined),
     filename ?? basename(filePath),
   );
   if (extraFields) {
@@ -224,6 +229,149 @@ function buildQuery(params: Record<string, unknown>, filterFields?: string[]): R
 function jsonResult(data: unknown, enrich = false) {
   const result = enrich ? enrichResult(data) : data;
   return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+}
+
+// --- Sender dispatch-readiness (powers check_sender_status) ---
+// Ported verbatim from cloud. Pure derivation from raw backend records so it is
+// testable without the network. A sender is ready on a channel when:
+//   LinkedIn — its bound seat is status 'active' with a non-expired cookie
+//   Email    — its bound mailbox send_status is 'active'
+// Channel state: 'working' (dispatches now) | 'error' (bound but blocked) |
+// 'not_connected' (nothing bound to this sender).
+type ChannelState = "working" | "error" | "not_connected";
+
+interface ChannelStatus {
+  state: ChannelState;
+  reason: string;
+  /** LinkedIn seat numeric id or mailbox uuid, when bound (for drill-down). */
+  ref?: string | number;
+}
+
+interface SenderStatus {
+  sender_profile_uuid: string;
+  sender_name: string | null;
+  linkedin: ChannelStatus;
+  email: ChannelStatus;
+  /** 'ready' when at least one channel can dispatch right now. */
+  overall: "ready" | "not_ready";
+  meaning: string;
+}
+
+function deriveSenderStatus(
+  senderUuid: string,
+  sender: Record<string, unknown> | null,
+  browser: Record<string, unknown> | null,
+  mailbox: Record<string, unknown> | null,
+): SenderStatus {
+  let linkedin: ChannelStatus;
+  if (!browser) {
+    linkedin = { state: "not_connected", reason: "No LinkedIn seat is bound to this sender." };
+  } else {
+    const status = String(browser.status ?? "");
+    const cookie = browser.cookie_status == null ? null : String(browser.cookie_status);
+    const id = typeof browser.id === "string" || typeof browser.id === "number" ? browser.id : undefined;
+    if (status === "active" && cookie !== "expired" && cookie !== "invalid") {
+      linkedin = { state: "working", reason: "Seat is active with a valid session — dispatches now.", ref: id };
+    } else {
+      const why = status !== "active" ? `seat status is '${status}'` : `session cookie is '${cookie}'`;
+      linkedin = { state: "error", reason: `Not ready — ${why}. Drill down with diagnose_linkedin_browser({ id: ${id ?? "?"} }).`, ref: id };
+    }
+  }
+
+  let email: ChannelStatus;
+  if (!mailbox) {
+    email = { state: "not_connected", reason: "No mailbox is bound to this sender." };
+  } else {
+    const sendStatus = String(mailbox.send_status ?? "");
+    const uuid = typeof mailbox.uuid === "string" ? mailbox.uuid : undefined;
+    if (sendStatus === "active") {
+      email = { state: "working", reason: "Mailbox send channel is active — dispatches now.", ref: uuid };
+    } else {
+      email = { state: "error", reason: `Not ready — mailbox send_status is '${sendStatus}'. Drill down with diagnose_mailbox({ uuid: "${uuid ?? "?"}" }).`, ref: uuid };
+    }
+  }
+
+  let senderName: string | null = null;
+  if (sender) {
+    if (typeof sender.name === "string" && sender.name.length > 0) senderName = sender.name;
+    else if (typeof sender.label === "string" && sender.label.length > 0) senderName = sender.label;
+  }
+
+  const overall: "ready" | "not_ready" =
+    linkedin.state === "working" || email.state === "working" ? "ready" : "not_ready";
+  const meaning =
+    overall === "ready"
+      ? `Sender can dispatch now (LinkedIn: ${linkedin.state}, email: ${email.state}).`
+      : `Sender cannot dispatch right now (LinkedIn: ${linkedin.state}, email: ${email.state}).`;
+
+  return { sender_profile_uuid: senderUuid, sender_name: senderName, linkedin, email, overall, meaning };
+}
+
+// --- Lead filter sanitation (backend LeadFilter compatibility) ---
+// Ported verbatim from cloud. The backend LeadFilter rejects some field names
+// outright with a 500 ("Wrong field passed ... field: X"). `updated_at` is the
+// confirmed offender — strip such keys before forwarding so a stray filter
+// degrades to a clear note instead of a 500.
+const UNSUPPORTED_LEAD_FILTER_KEYS = ["updated_at"] as const;
+
+function dropUnsupportedLeadFilterKeys(
+  filter: Record<string, unknown> | undefined,
+): { filter: Record<string, unknown>; dropped: string[] } {
+  const out: Record<string, unknown> = {};
+  const dropped: string[] = [];
+  const banned = UNSUPPORTED_LEAD_FILTER_KEYS as readonly string[];
+  for (const [k, v] of Object.entries(filter ?? {})) {
+    if (banned.includes(k)) dropped.push(k);
+    else out[k] = v;
+  }
+  return { filter: out, dropped };
+}
+
+// --- URL-based import body builder (powers import_sn_* / import_ln_* tools) ---
+// Ported verbatim from cloud. Builds the /leads/api/data-sources request body
+// for a URL-driven import job (Sales Navigator / LinkedIn search / post engagement).
+const buildUrlImportBody = (
+  type: string,
+  list_uuid: string,
+  url: string,
+  extras: {
+    sender_profile_uuid?: string;
+    tags?: string[];
+    force_list_move?: boolean;
+    add_tags_to_duplicate?: boolean;
+    extra_payload?: Record<string, unknown>;
+  },
+): Record<string, unknown> => {
+  const body: Record<string, unknown> = { type, list_uuid };
+  if (extras.sender_profile_uuid) body.sender_profile_uuid = extras.sender_profile_uuid;
+  if (extras.tags && extras.tags.length > 0) body.tags = extras.tags;
+  body.payload = {
+    url,
+    force_list_move: extras.force_list_move ?? false,
+    add_tags_to_duplicate: extras.add_tags_to_duplicate ?? false,
+    ...(extras.extra_payload ?? {}),
+  };
+  return body;
+};
+
+// --- Typed CSV import (powers update_leads_from_csv / update_companies_from_csv /
+// add_to_blacklist_from_csv). LOCAL ADAPTATION of cloud's uploadCsvWithType:
+// cloud is a remote server so it takes base64 file content; the local stdio
+// server runs on the user's machine and reads the file from disk by path,
+// matching upload_csv / upload_attachment. The backend request is identical
+// (POST /leads/api/file-imports/upload-csv, multipart field "file",
+// extra fields {type, list_uuid?}, no payload fields).
+async function uploadCsvImport(
+  type: string,
+  file_path: string,
+  list_uuid: string | undefined,
+  filename?: string,
+): Promise<unknown> {
+  const extraFields: Record<string, string> = { type };
+  if (list_uuid) extraFields.list_uuid = list_uuid;
+  // Send the file part as text/csv to match cloud's uploadCsvWithType (mime_type
+  // default) — makes the backend request byte-identical to the production server.
+  return grinfiUpload("/leads/api/file-imports/upload-csv", file_path, "file", filename, extraFields, "text/csv");
 }
 
 // --- Build MCP server with all tools ---
@@ -3574,6 +3722,1156 @@ function createMcpServer(): McpServer {
       });
     });
   }
+
+
+  // ===========================
+  // CRM READ & HELPERS (ported from cloud)
+  // ===========================
+
+  server.tool(
+    "get_leads_by_uuids",
+    `Fetch multiple contacts by their UUIDs in one round-trip. Triggers: "give me details for these contacts: X, Y, Z", "fetch full profiles for uuids …", "hydrate this list of lead UUIDs". The inverse of list_lead_uuids — use this after picking UUIDs to get the full contact objects without N+1 calls. Returns array of full lead objects with all fields including _grinfi_contact_url. Required: uuids (array).`,
+    { uuids: z.array(z.string()).describe("Contact UUIDs to fetch in one call") },
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async (params) => {
+      const result = await grinfiRequest("POST", "/leads/api/leads/list-by-uuids", { uuids: params.uuids });
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "list_lead_uuids",
+    `Lightweight UUID-only listing of leads matching a filter — much smaller than search_contacts. Triggers: "give me UUIDs for all leads in list X", "audit which contacts match this filter", "preview before mass action". Returns [{uuid, name}] (~50 bytes/lead) or plain ["uuid", ...] in compact mode (~38 bytes/lead). Use for previewing or auditing before a mass-action. For ACTUAL mass operations, prefer leads_mass_action_by_filter — it fetches UUIDs server-side and never round-trips them through Claude. Same filter shape as search_contacts. Hard cap 2500 per call.`,
+    {
+      filter: z.record(z.string(), z.unknown()).optional().describe("Filter object. Examples: {list_uuid: 'X'}, {pipeline_stage_uuid: 'Y'}, {tags: ['Z']}, {q: 'Acme'}. Same shape as search_contacts."),
+      limit: z.number().int().min(1).max(2500).optional().describe("Max records per call. Default 100, hard cap 2500. With names the per-frame budget is ~1200 leads (~180KB); compact mode fits ~2500 (~95KB). Above limit → MCP frame may exceed Claude's per-tool-result token cap and the response will be truncated to a temp file. Paginate with offset for larger sets, OR (preferred) use leads_mass_action_by_filter to skip the round-trip entirely."),
+      offset: z.number().int().min(0).optional().describe("Pagination offset, default 0. Use with limit to page through large result sets."),
+      order_field: z.string().optional().describe("Sort field, default 'created_at'."),
+      order_type: z.enum(["asc", "desc"]).optional().describe("Sort direction, default 'desc'."),
+      compact: z.boolean().optional().describe("When true (default false), strip the `name` field and return data as plain string UUIDs: ['uuid1', 'uuid2', ...]. Cuts response size by ~40% — recommended for limit > 1000."),
+    },
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async (params) => {
+      const body: Record<string, unknown> = {
+        limit: params.limit ?? 100,
+        offset: params.offset ?? 0,
+        order_field: params.order_field ?? "created_at",
+        order_type: params.order_type ?? "desc",
+      };
+      const { filter: cleanedFilter } = dropUnsupportedLeadFilterKeys(params.filter as Record<string, unknown> | undefined);
+      if (Object.keys(cleanedFilter).length > 0) body.filter = cleanedFilter;
+      // NOTE: backend response shape is {data: [{lead: {uuid, name, ...}, markers, flows, ...}], total, has_more}.
+      // We extract just lead.uuid (+ optional name). Avoid disable_aggregation:true here — it strips the lead
+      // nesting and the response no longer carries usable identifiers.
+      const raw = await grinfiRequest("POST", "/leads/api/leads/search", body) as {
+        data?: Array<{
+          lead?: { uuid?: string; name?: string; first_name?: string; last_name?: string };
+          uuid?: string;
+          name?: string;
+          first_name?: string;
+          last_name?: string;
+        }>;
+        total?: number;
+        has_more?: boolean;
+      };
+      const compact = params.compact === true;
+      const rawData = raw.data ?? [];
+      const data: unknown = compact
+        ? rawData.map((item) => (item.lead?.uuid ?? item.uuid ?? "")).filter(Boolean)
+        : rawData.map((item) => {
+            // Defensive: handle both nested-lead shape and flat-row shape.
+            const lead = item.lead ?? item;
+            const uuid = (lead as { uuid?: string }).uuid ?? "";
+            const fullName =
+              (lead as { name?: string }).name ||
+              [(lead as { first_name?: string }).first_name, (lead as { last_name?: string }).last_name]
+                .filter(Boolean)
+                .join(" ") ||
+              "Unknown";
+            return { uuid, name: fullName };
+          });
+      const count = Array.isArray(data) ? data.length : 0;
+      return jsonResult({
+        data,
+        limit: body.limit,
+        offset: body.offset,
+        total: raw.total ?? count,
+        has_more: raw.has_more ?? count >= (body.limit as number),
+        compact,
+      });
+    }
+  );
+
+  server.tool(
+    "list_company_uuids",
+    `Lightweight UUID-only listing of companies matching a filter — same idea as list_lead_uuids but for companies. Triggers: "show me UUIDs of all companies in industry X", "preview which accounts would be affected before mass action", "audit companies matching this filter". Returns [{uuid, name}] (small payload). Use BEFORE companies_mass_action when you need to operate on every company matching a filter. Optional filter (same shape as list_companies), limit, offset.`,
+    {
+      filter: z.record(z.string(), z.unknown()).optional().describe("Same filter shape as list_companies"),
+      limit: z.number().int().min(1).max(2500).optional().describe("Default 100, hard cap 2500"),
+      offset: z.number().int().min(0).optional(),
+      order_field: z.string().optional(),
+      order_type: z.enum(["asc", "desc"]).optional(),
+    },
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async (params) => {
+      const body: Record<string, unknown> = {
+        limit: params.limit ?? 100,
+        offset: params.offset ?? 0,
+        order_field: params.order_field ?? "created_at",
+        order_type: params.order_type ?? "desc",
+      };
+      if (params.filter) body.filter = params.filter;
+      const result = await grinfiRequest("POST", "/leads/api/companies/list-uuids", body);
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "suggest_lead_filter_values",
+    `Typeahead suggestions for contact filter fields — discover valid values to filter by without dumping the whole inventory. Triggers: "what companies are in the CRM that start with Acme", "suggest tag values matching X", "autocomplete pipeline stages for lead filter". Returns array of {value, count} for the requested field. Useful for agents to refine queries before search_contacts. Required: field (e.g. 'company_name', 'tag', 'pipeline_stage', 'sender_profile'). Optional: q (text prefix), limit.`,
+    {
+      field: z.string().describe("Field to suggest values for (e.g. 'company_name', 'tags', 'pipeline_stage_uuid')"),
+      q: z.string().optional().describe("Text prefix to filter suggestions (e.g. 'Acm' to match 'Acme', 'Acmecorp')"),
+      limit: z.number().int().min(1).max(100).optional().describe("Max suggestions to return (default 20)"),
+    },
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async (params) => {
+      const body: Record<string, unknown> = { field: params.field };
+      if (params.q !== undefined) body.q = params.q;
+      if (params.limit !== undefined) body.limit = params.limit;
+      const result = await grinfiRequest("POST", "/leads/api/leads/search-suggestions", body);
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "suggest_company_filter_values",
+    `Typeahead suggestions for company filter fields — same as suggest_lead_filter_values but for the companies side. Triggers: "what industries do we have", "suggest country values for company filter", "autocomplete account tags starting with X". Returns array of {value, count}. Required: field. Optional: q (text prefix), limit.`,
+    {
+      field: z.string().describe("Field to suggest values for (e.g. 'industry', 'country', 'tags')"),
+      q: z.string().optional().describe("Text prefix filter"),
+      limit: z.number().int().min(1).max(100).optional(),
+    },
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async (params) => {
+      const body: Record<string, unknown> = { field: params.field };
+      if (params.q !== undefined) body.q = params.q;
+      if (params.limit !== undefined) body.limit = params.limit;
+      const result = await grinfiRequest("POST", "/leads/api/companies/search-suggestions", body);
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "create_lead",
+    `Create one or more leads in a target list — bulk-friendly alternative to upsert_contact (which is per-record and handles updates). Pass an array of partial lead objects; backend assigns UUIDs. Triggers: "create leads in list X", "bulk add leads", "add new contacts to list". Required: list_uuid, leads (array of lead objects with at least one identifying field like linkedin / work_email / first_name). Returns array of created lead records with UUIDs. Backed by POST /leads/api/leads/.`,
+    {
+      list_uuid: z.string().describe("UUID of the target list (from list_lists)."),
+      leads: z.array(z.record(z.string(), z.unknown())).describe("Array of lead objects. Each may include: first_name, last_name, company_name, linkedin, ln_id, sn_id, work_email, personal_email, position, headline, about, raw_address, domain, etc."),
+    },
+    { readOnlyHint: false, destructiveHint: false },
+    async (params) => {
+      const result = await grinfiRequest("POST", "/leads/api/leads/", { leads: params.leads, list_uuid: params.list_uuid });
+      return jsonResult(result, true);
+    },
+  );
+
+  // ===========================
+  // METRICS & STATISTICS (ported from cloud)
+  // ===========================
+
+  server.tool(
+    "get_custom_field_metrics",
+    `Fetch usage metrics for one or more custom fields by UUID — how many leads/companies actually have a value set, distribution stats. Triggers: "custom field usage stats", "how many leads use custom field X", "custom field coverage". Required: uuids (array of custom-field UUIDs from list_custom_fields). NOTE: backend uses HTTP PUT for this read-only operation. Backed by PUT /leads/api/custom-fields/metrics.`,
+    {
+      uuids: z.array(z.string()).describe("Array of custom-field UUIDs to fetch metrics for."),
+    },
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async (params) => {
+      const result = await grinfiRequest("PUT", "/leads/api/custom-fields/metrics", { uuids: params.uuids });
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "get_pipeline_stage_metrics",
+    `Funnel analytics: how many leads/companies sit in each pipeline stage right now. Triggers: "how many leads are at each pipeline stage", "show negotiation-stage count", "pipeline funnel", "where are leads stuck". Returns {uuid: {leads_count, companies_count}} for the requested stage UUIDs. Use list_pipeline_stages first to get UUIDs, then this for counts. Required: uuids (stage UUIDs).`,
+    { uuids: z.array(z.string()).describe("Pipeline stage UUIDs (from list_pipeline_stages)") },
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async (params) => {
+      const result = await grinfiRequest("PUT", "/leads/api/pipeline-stages/metrics", { uuids: params.uuids });
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "get_sender_profile_metrics",
+    `Per-sender performance analytics: sends, replies, bounces, response-rate for each sender profile. Triggers: "which sender has the best reply rate", "compare sender performance", "sender stats for last 30 days", "how is John's mailbox doing". Returns {uuid: {sent, delivered, replies, bounces, ...}}. Required: uuids (sender profile UUIDs). Optional metrics filter.`,
+    {
+      uuids: z.array(z.string()).describe("Sender profile UUIDs (from list_sender_profiles)"),
+      metrics: z.array(z.string()).optional().describe("Specific metric names; if omitted, returns all"),
+    },
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async (params) => {
+      const body: Record<string, unknown> = { uuids: params.uuids };
+      if (params.metrics) body.metrics = params.metrics;
+      const result = await grinfiRequest("POST", "/flows/api/sender-profiles/metrics", body);
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "get_outreach_metrics",
+    `High-level outreach analytics in ONE call: how many connection requests were SENT vs ACCEPTED, how many messages went out, how many got replies, computed acceptance / reply rates. Triggers: "outreach stats", "how is the campaign performing", "connect rate", "reply rate", "show me sent vs accepted last week", "campaign metrics", "outreach dashboard". Optional scope: flow_uuids (specific campaigns) or sender_profile_uuids (specific senders); omit both = whole workspace. group_by='total' (default, sum) | 'flow' (per-flow rows) | 'sender' (per-sender rows). Always returns CLOSED task counts (actually sent, not just scheduled). Use schedule_at_after / schedule_at_before to bound the period — REQUIRED to avoid all-time scan. Numbers backed by 5 parallel get_tasks_group_counts calls under the hood.`,
+    {
+      schedule_at_after: z.string().describe("REQUIRED. ISO timestamp lower bound (e.g. '2026-05-09T00:00:00Z')"),
+      schedule_at_before: z.string().describe("REQUIRED. ISO timestamp upper bound (e.g. '2026-05-16T00:00:00Z')"),
+      flow_uuids: z.array(z.string()).optional().describe("Restrict to these flows (campaigns). Omit for whole workspace."),
+      sender_profile_uuids: z.array(z.string()).optional().describe("Restrict to these sender profiles. Omit for all senders."),
+      group_by: z.enum(["total", "flow", "sender"]).optional().describe("'total' (default, single aggregated row) | 'flow' (per-flow breakdown) | 'sender' (per-sender breakdown)"),
+    },
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async (params) => {
+      const groupBy = params.group_by ?? "total";
+      // Map group_by to the underlying group_field. For 'total' we still need a group field
+      // (backend requires it) — use 'type' which we then merge across.
+      const groupField = groupBy === "flow" ? "flow_uuid" : groupBy === "sender" ? "sender_profile_uuid" : null;
+
+      // Base filter shared by all 5 metric calls.
+      const baseFilter: Record<string, unknown> = {
+        automation: "auto",
+        schedule_at: { ">=": params.schedule_at_after, "<": params.schedule_at_before },
+      };
+      if (params.flow_uuids && params.flow_uuids.length > 0) baseFilter.flow_uuid = params.flow_uuids;
+      if (params.sender_profile_uuids && params.sender_profile_uuids.length > 0) baseFilter.sender_profile_uuid = params.sender_profile_uuids;
+
+      // Helper: call group-counts with type+status overrides.
+      const fetchMetric = async (taskTypes: string[], statuses?: string[]): Promise<Record<string, number>> => {
+        const filter: Record<string, unknown> = { ...baseFilter, type: taskTypes };
+        if (statuses) filter.status = statuses;
+        const result = await grinfiRequest("POST", "/flows/api/tasks/group-counts", {
+          filter,
+          // If grouping by flow/sender, use that field; else group by 'type' (we'll sum)
+          group_field: groupField ?? "type",
+        }) as Record<string, number>;
+        return result ?? {};
+      };
+
+      // Fire 5 metric queries in parallel.
+      const [
+        connectionsSent,           // closed linkedin_send_connection_request
+        connectionsAccepted,       // trigger_linkedin_connection_request_accepted (no status filter — triggers complete when fired)
+        connectionsWithdrawn,      // closed linkedin_withdraw_connection_request
+        linkedinMessagesSent,      // closed linkedin_send_message
+        linkedinReplies,           // trigger_message_replied
+        emailsSent,                // closed gs_send_email (empty if workspace doesn't use email)
+      ] = await Promise.all([
+        fetchMetric(["linkedin_send_connection_request"], ["closed"]),
+        fetchMetric(["trigger_linkedin_connection_request_accepted"]),
+        fetchMetric(["linkedin_withdraw_connection_request"], ["closed"]),
+        fetchMetric(["linkedin_send_message"], ["closed"]),
+        fetchMetric(["trigger_message_replied"]),
+        fetchMetric(["gs_send_email"], ["closed"]),
+      ]);
+
+      // Sum helper for total-mode (group_field was 'type' so values come back as {linkedin_send_message: N})
+      const sumValues = (obj: Record<string, number>): number =>
+        Object.values(obj).reduce((a, b) => a + (typeof b === "number" ? b : 0), 0);
+
+      if (groupBy === "total") {
+        const totals = {
+          linkedin_connections_sent: sumValues(connectionsSent),
+          linkedin_connections_accepted: sumValues(connectionsAccepted),
+          linkedin_connections_withdrawn: sumValues(connectionsWithdrawn),
+          linkedin_messages_sent: sumValues(linkedinMessagesSent),
+          linkedin_replies: sumValues(linkedinReplies),
+          emails_sent: sumValues(emailsSent),
+        };
+        const acceptance_rate_pct = totals.linkedin_connections_sent > 0
+          ? Math.round(1000 * totals.linkedin_connections_accepted / totals.linkedin_connections_sent) / 10
+          : null;
+        const reply_rate_pct = totals.linkedin_messages_sent > 0
+          ? Math.round(1000 * totals.linkedin_replies / totals.linkedin_messages_sent) / 10
+          : null;
+        return jsonResult({
+          period: { from: params.schedule_at_after, to: params.schedule_at_before },
+          scope: {
+            flow_uuids: params.flow_uuids ?? "all",
+            sender_profile_uuids: params.sender_profile_uuids ?? "all",
+          },
+          totals: { ...totals, acceptance_rate_pct, reply_rate_pct },
+        });
+      }
+
+      // group_by='flow' or 'sender' — merge per-key (UUID) into rows.
+      const allKeys = new Set<string>([
+        ...Object.keys(connectionsSent),
+        ...Object.keys(connectionsAccepted),
+        ...Object.keys(connectionsWithdrawn),
+        ...Object.keys(linkedinMessagesSent),
+        ...Object.keys(linkedinReplies),
+        ...Object.keys(emailsSent),
+      ]);
+      const rows = Array.from(allKeys).map((key) => {
+        const sent = connectionsSent[key] ?? 0;
+        const accepted = connectionsAccepted[key] ?? 0;
+        const withdrawn = connectionsWithdrawn[key] ?? 0;
+        const msgSent = linkedinMessagesSent[key] ?? 0;
+        const replies = linkedinReplies[key] ?? 0;
+        const emails = emailsSent[key] ?? 0;
+        return {
+          [groupBy === "flow" ? "flow_uuid" : "sender_profile_uuid"]: key,
+          linkedin_connections_sent: sent,
+          linkedin_connections_accepted: accepted,
+          linkedin_connections_withdrawn: withdrawn,
+          linkedin_messages_sent: msgSent,
+          linkedin_replies: replies,
+          emails_sent: emails,
+          acceptance_rate_pct: sent > 0 ? Math.round(1000 * accepted / sent) / 10 : null,
+          reply_rate_pct: msgSent > 0 ? Math.round(1000 * replies / msgSent) / 10 : null,
+        };
+      });
+      // Sort rows by sent volume desc for readability
+      rows.sort((a, b) => (b.linkedin_connections_sent as number) - (a.linkedin_connections_sent as number));
+      return jsonResult({
+        period: { from: params.schedule_at_after, to: params.schedule_at_before },
+        scope: {
+          flow_uuids: params.flow_uuids ?? "all",
+          sender_profile_uuids: params.sender_profile_uuids ?? "all",
+        },
+        group_by: groupBy,
+        rows,
+      });
+    },
+  );
+
+  server.tool(
+    "get_ai_agent_lead_metrics",
+    `Fetch performance metrics for one or more AI agents — counts of leads engaged, by engagement status (interested, not interested, pending, etc.), per agent. Use to compare AI agent effectiveness or to populate an analytics dashboard. Triggers: "how is AI agent X performing", "compare AI agents", "AI agent metrics", "engagement breakdown by agent". Returns a metrics object keyed by ai_agent_uuid. Required: ai_agent_uuids (array of agent UUIDs from list_ai_agents). Backed by POST /leads/api/leads/ai-agent-metrics.`,
+    {
+      ai_agent_uuids: z.array(z.string()).describe("UUIDs of AI agents to fetch metrics for. Get via list_ai_agents."),
+    },
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async (params) => {
+      const result = await grinfiRequest("POST", "/leads/api/leads/ai-agent-metrics", { ai_agent_uuids: params.ai_agent_uuids });
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "get_flow_node_statistics",
+    `Per-step funnel for an automation: how many leads passed through each node (step) and where they dropped off. Triggers: "where do leads drop off in my flow", "show step-by-step conversion for automation X", "flow funnel analytics", "which step has highest skip rate". Returns array of {node_id, type, in, out, completed, failed, ...} for each node. Use this to debug a flow's weak spots. Required: flow_uuid AND node_ids (integer ids of the flow's nodes) — the backend rejects the call without node_ids. (Note: a dedicated node-graph reader isn't exposed yet, so node_ids must already be known; for flow-level analytics prefer get_outreach_metrics / get_dashboard.)`,
+    {
+      flow_uuid: z.string().describe("Automation/flow UUID (canonical Flow.uuid from list_automations)"),
+      node_ids: z.array(z.number().int()).min(1).describe("Integer ids of the flow's nodes. REQUIRED — the backend rejects the call without them."),
+      filter: z.record(z.string(), z.unknown()).optional().describe("Optional date-range or contact filter"),
+    },
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async (params) => {
+      const body: Record<string, unknown> = { node_ids: params.node_ids };
+      if (params.filter) body.filter = params.filter;
+      const result = await grinfiRequest("POST", `/flows/api/flows/${params.flow_uuid}/statistics/nodes`, body);
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "get_flow_contact_source_statistics",
+    `Fetch per-contact-source breakdown of leads inside an automation/flow — useful for "where did the leads in this flow come from" analytics. Each source row carries counts (added, completed, etc.). Triggers: "where do flow leads come from", "contact source breakdown for flow X", "lead source stats per flow". Required: flow_uuid (path), contact_source_ids (array of data-source/list IDs). Backed by POST /flows/api/flows/{uuid}/statistics/contact-sources.`,
+    {
+      flow_uuid: z.string().describe("UUID of the flow/automation."),
+      contact_source_ids: z.array(z.union([z.string(), z.number()])).describe("Array of contact-source IDs (data-source / list ids) to aggregate over."),
+    },
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async (params) => {
+      const result = await grinfiRequest("POST", `/flows/api/flows/${params.flow_uuid}/statistics/contact-sources`, { contact_source_ids: params.contact_source_ids });
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "get_enrichment_queue_metrics_filtered",
+    `Fetch enrichment-queue metrics for the current month (count of jobs processed) — optionally narrowed by a filter object (provider, type, status, date range). Lighter than get_enrichment_metrics if you only need the monthly counter. Triggers: "this month enrichment count", "enrichment usage this month", "how many enrichments did I run". Optional: filter object. Backed by POST /leads/api/enrichment-queue/metrics.`,
+    {
+      filter: z.record(z.string(), z.unknown()).optional().describe("Optional filter narrowing the metrics (provider, type, status, date range, etc.)."),
+    },
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async (params) => {
+      const body: Record<string, unknown> = {};
+      if (params.filter) body.filter = params.filter;
+      const result = await grinfiRequest("POST", "/leads/api/enrichment-queue/metrics", body);
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "get_enrichment_queue_item",
+    `Fetch a single enrichment-queue item by its numeric ID — full detail including provider, status, cost, lead/company target. Use for drill-down after list_enrichment_queue. Triggers: "show enrichment item N", "what happened with enrichment job 12345", "details for enrichment queue entry". Required: id (integer — NOT a UUID; queue items use sequential int IDs). Backed by GET /leads/api/enrichment-queue/{id}.`,
+    {
+      id: z.number().int().describe("Integer ID of the enrichment-queue item (from list_enrichment_queue rows). Must be int, not UUID."),
+    },
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async (params) => {
+      const result = await grinfiRequest("GET", `/leads/api/enrichment-queue/${params.id}`);
+      return jsonResult(result);
+    },
+  );
+
+  // ===========================
+  // MASS ACTIONS (ported from cloud)
+  // ===========================
+
+  server.tool(
+    "leads_mass_action_by_filter",
+    `DEFAULT tool for filter-based bulk contact operations — server fetches UUIDs, chunks them, applies the action. Triggers: "move all leads from list X to Y", "tag everyone at hot stage", "delete all leads tagged cold", "mark all unread as read", "change pipeline stage for everyone in list Q", "перенеси всех", "удали всех с тегом Z". ANY phrase with "all/every/everyone/всех/усі" + criteria → THIS tool. Required: type (contact_change_list | contact_add_tags | contact_remove_tags | contact_replace_tags | contact_change_pipeline_stage | contact_mark_read | contact_mark_unread | contact_delete), filter (same shape as search_contacts). Optional: payload, chunk_size (500), max_total (cap 10000), dry_run (ALWAYS run dry_run:true first for destructive ops). Counter-example: "delete leads X,Y,Z" with concrete UUIDs → use leads_mass_action.`,
+    {
+      type: z.string().describe("Mass action type — same canonical names as leads_mass_action."),
+      filter: z.record(z.string(), z.unknown()).describe("Search filter (same shape as list_lead_uuids / search_contacts). Examples: {list_uuid:'X'}, {pipeline_stage_uuid:'Y'}, {tags:['Z']}, {q:'Acme'}. Operators (>=, <=, etc.) supported."),
+      payload: z.record(z.string(), z.unknown()).optional().describe("Action payload — same shape as leads_mass_action.payload."),
+      chunk_size: z.number().int().min(1).max(2000).optional().describe("Max UUIDs per backend mass-action call. Default 500. Increase only if backend can handle larger batches in one request."),
+      max_total: z.number().int().min(1).max(100000).optional().describe("Safety cap on total leads acted on. Default 10000 — protects against accidentally selecting the entire workspace. Increase explicitly for legitimate large ops."),
+      dry_run: z.boolean().optional().describe("When true, only fetch matched UUIDs — do NOT execute mass-action. Returns {dry_run: true, total_matched, sample_uuids: first 5}. ALWAYS run dry_run:true first to verify the filter before destructive ops like contact_delete."),
+    },
+    { readOnlyHint: false, destructiveHint: true },
+    async (params) => {
+      // Guard: an unsupported lead-filter field (e.g. updated_at) makes the backend
+      // reject the search mid-paging (500). Refuse up front — never run a destructive
+      // mass action on a filter the backend can't honour (wrong-scope risk).
+      const { dropped: unsupported } = dropUnsupportedLeadFilterKeys(params.filter as Record<string, unknown> | undefined);
+      if (unsupported.length > 0) {
+        throw new Error(`Filter contains unsupported lead field(s): ${unsupported.join(", ")}. Not filterable on leads — remove them and use a supported field (list_uuid, pipeline_stage_uuid, tags, created_at, q) before running a mass action.`);
+      }
+      const chunkSize = params.chunk_size ?? 500;
+      const maxTotal = params.max_total ?? 10000;
+      const pageSize = 2000; // backend handles up to ~2500 reliably per ops notes
+      // 1) Page through search to collect UUIDs server-side
+      const allUuids: string[] = [];
+      let offset = 0;
+      while (allUuids.length < maxTotal) {
+        const remaining = maxTotal - allUuids.length;
+        const limit = Math.min(pageSize, remaining);
+        const page = await grinfiRequest("POST", "/leads/api/leads/search", {
+          limit,
+          offset,
+          order_field: "created_at",
+          order_type: "desc",
+          filter: params.filter,
+        }) as {
+          data?: Array<{ lead?: { uuid?: string }; uuid?: string }>;
+          has_more?: boolean;
+          total?: number;
+        };
+        const items = (page.data ?? [])
+          .map((it) => it.lead?.uuid ?? it.uuid ?? "")
+          .filter((uuid): uuid is string => Boolean(uuid));
+        allUuids.push(...items);
+        if (!page.has_more || items.length === 0 || items.length < limit) break;
+        offset += limit;
+      }
+      if (params.dry_run === true) {
+        return jsonResult({
+          dry_run: true,
+          total_matched: allUuids.length,
+          sample_uuids: allUuids.slice(0, 5),
+          chunk_size: chunkSize,
+          would_execute_chunks: Math.ceil(allUuids.length / chunkSize),
+        });
+      }
+      if (allUuids.length === 0) {
+        return jsonResult({ ok: true, total_matched: 0, total_processed: 0, chunks: [] });
+      }
+      // 2) Apply mass-action in chunks. Don't abort on chunk error — record and continue.
+      // Safety is enforced by the dry_run preview above + the max_total cap; the
+      // cloud-only HMAC confirm-token gate is intentionally omitted here to match
+      // local's convention (see leads_mass_action — no gate, dry_run + description).
+      const chunks: Array<{ chunk: number; size: number; status: "ok" | "error"; error?: string }> = [];
+      let processed = 0;
+      for (let i = 0; i < allUuids.length; i += chunkSize) {
+        const chunkUuids = allUuids.slice(i, i + chunkSize);
+        const body: Record<string, unknown> = {
+          type: params.type,
+          filter: { all: false, ids: chunkUuids, excludeIds: [] },
+        };
+        if (params.payload) body.payload = params.payload;
+        try {
+          await grinfiRequest("PUT", "/leads/api/leads/mass-action", body);
+          chunks.push({ chunk: Math.floor(i / chunkSize) + 1, size: chunkUuids.length, status: "ok" });
+          processed += chunkUuids.length;
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          chunks.push({ chunk: Math.floor(i / chunkSize) + 1, size: chunkUuids.length, status: "error", error: msg });
+        }
+      }
+      return jsonResult({
+        ok: chunks.every((c) => c.status === "ok"),
+        total_matched: allUuids.length,
+        total_processed: processed,
+        chunks,
+      });
+    }
+  );
+
+  server.tool(
+    "list_mass_actions",
+    `Browse the history of mass-action jobs that have been run on this workspace. Triggers: "show recent bulk operations", "what mass actions did I run today", "list pending bulk jobs", "audit mass-action history". Returns paginated list of {uuid, type, status, total, completed, created_at, ...}. Use to check if your previous leads_mass_action / leads_mass_action_by_filter / companies_mass_action call has finished processing in the backend queue. Optional pagination: limit, offset, order_field, order_type.`,
+    {
+      limit: z.number().int().min(1).max(200).optional(),
+      offset: z.number().int().min(0).optional(),
+      order_field: z.string().optional().describe("Default 'created_at'"),
+      order_type: z.enum(["asc", "desc"]).optional().describe("Default 'desc'"),
+    },
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async (params) => {
+      const result = await grinfiRequest("GET", "/leads/api/mass-actions", undefined, buildQuery(params));
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "get_mass_action_status",
+    `Poll the status of a specific mass-action job by UUID. Triggers: "did my last mass action finish?", "check status of bulk operation X", "is the mass move done yet?". Returns {uuid, type, status, total, completed, failed, errors?, created_at, ...}. status is 'queued' | 'in_progress' | 'completed' | 'failed' | 'cancelled'. Use after firing leads_mass_action_by_filter to confirm completion before moving on. Required: uuid (from list_mass_actions or returned by the mass-action tool itself).`,
+    { uuid: z.string().describe("Mass-action job UUID") },
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async (params) => {
+      const result = await grinfiRequest("GET", `/leads/api/mass-actions/${params.uuid}`);
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "get_mass_action_metrics",
+    `Fetch execution metrics for one or more mass-action jobs by their UUIDs — progress, succeeded/failed counts, status. Use after queueing a leads_mass_action / leads_mass_action_by_filter / companies_mass_action to poll completion. Triggers: "is my mass-action done", "mass action progress", "check mass action status". Returns a metrics object keyed by mass-action uuid. Required: uuids (array). Backed by POST /leads/api/mass-actions/metrics.`,
+    {
+      uuids: z.array(z.string()).describe("UUIDs of mass-action jobs to inspect. Returned by leads_mass_action / leads_mass_action_by_filter responses."),
+    },
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async (params) => {
+      const result = await grinfiRequest("POST", "/leads/api/mass-actions/metrics", { uuids: params.uuids });
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "cancel_mass_action",
+    `DESTRUCTIVE — abort a still-running mass-action job before it finishes. Triggers: "cancel that bulk move I just started", "stop the mass delete", "abort mass action X". Only works for jobs in 'queued' or 'in_progress' status. Returns the updated job. Use this as a safety primitive if you fire a mass operation and realize it was wrong. Required: uuid (from list_mass_actions or get_mass_action_status). NOTE: backend may have already processed some leads before cancellation — partial effect is possible.`,
+    { uuid: z.string().describe("Mass-action job UUID to cancel") },
+    { readOnlyHint: false, destructiveHint: true, idempotentHint: false },
+    async (params) => {
+      const result = await grinfiRequest("DELETE", `/leads/api/mass-actions/${params.uuid}`);
+      return jsonResult(result);
+    },
+  );
+
+  // ===========================
+  // CSV BULK IMPORT/UPDATE (ported from cloud, file_path-adapted)
+  // ===========================
+
+  server.tool(
+    "update_leads_from_csv",
+    `Bulk-update existing contacts (matched by uuid/email) from a CSV file — creates a real persistent csv_update_leads import job. Triggers: "update contacts from CSV", "bulk edit leads from spreadsheet", "apply CSV updates to leads". Required: file_path (absolute path on the machine running this MCP server). Optional: list_uuid (target), filename. Backend auto-detects column headers; refine via update_data_source if mapping is wrong. Irreversible without restoring from backup.`,
+    {
+      file_path: z.string().describe("Absolute path to the CSV file on the local machine running this MCP server"),
+      list_uuid: z.string().optional().describe("Target contact list; if omitted, no list filter"),
+      filename: z.string().optional().describe("Override the filename sent to Grinfi (defaults to the basename of file_path)"),
+    },
+    { readOnlyHint: false, destructiveHint: false },
+    async (params) => {
+      const result = await uploadCsvImport("csv_update_leads", params.file_path, params.list_uuid, params.filename);
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "update_companies_from_csv",
+    `Bulk-update existing companies from a CSV — creates a real persistent csv_update_accounts import job. Triggers: "update companies from CSV", "bulk edit accounts from spreadsheet", "apply CSV updates to companies". Required: file_path. Optional: list_uuid, filename. Auto-maps columns; refine via update_data_source if wrong. Irreversible without restoring from backup.`,
+    {
+      file_path: z.string().describe("Absolute path to the CSV file on the local machine running this MCP server"),
+      list_uuid: z.string().optional().describe("Target contact list; if omitted, no list filter"),
+      filename: z.string().optional().describe("Override the filename sent to Grinfi (defaults to the basename of file_path)"),
+    },
+    { readOnlyHint: false, destructiveHint: false },
+    async (params) => {
+      const result = await uploadCsvImport("csv_update_accounts", params.file_path, params.list_uuid, params.filename);
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "add_to_blacklist_from_csv",
+    `Bulk-add contacts to the blacklist from a CSV (emails, LinkedIn IDs, or UUIDs) — creates a real persistent csv_blacklist_leads import job. Triggers: "upload unsubscribes", "bulk add to blacklist", "import opt-outs", "add suppressions from CSV". Required: file_path. Optional: list_uuid, filename. Blacklisted contacts will be excluded from all future outreach. For single-contact blacklisting use add_to_leads_blacklist.`,
+    {
+      file_path: z.string().describe("Absolute path to the CSV file on the local machine running this MCP server"),
+      list_uuid: z.string().optional().describe("Target contact list; if omitted, no list filter"),
+      filename: z.string().optional().describe("Override the filename sent to Grinfi (defaults to the basename of file_path)"),
+    },
+    { readOnlyHint: false, destructiveHint: false },
+    async (params) => {
+      const result = await uploadCsvImport("csv_blacklist_leads", params.file_path, params.list_uuid, params.filename);
+      return jsonResult(result);
+    },
+  );
+
+  // ===========================
+  // LEAD IMPORTS — LinkedIn / Sales Navigator (ported from cloud)
+  // ===========================
+
+  server.tool(
+    "import_ln_leads_search",
+    `Queue a regular LinkedIn (NOT Sales Navigator) people-search import — creates real persistent job for users without SN. Triggers: "import LinkedIn search", "pull from regular LinkedIn search", "non-SN people search". Required: search_url (https://www.linkedin.com/search/results/people?...), list_uuid. Optional: sender_profile_uuid (required for execution), tags, force_list_move, add_tags_to_duplicate.`,
+    {
+      search_url: z.string().url().describe("Regular LinkedIn search URL (https://www.linkedin.com/search/results/people?...)"),
+      list_uuid: z.string().describe("Target contact list"),
+      sender_profile_uuid: z.string().optional(),
+      tags: z.array(z.string()).optional(),
+      force_list_move: z.boolean().optional(),
+      add_tags_to_duplicate: z.boolean().optional(),
+    },
+    { readOnlyHint: false, destructiveHint: false },
+    async (params) => {
+      const body = buildUrlImportBody("ln_leads_search", params.list_uuid, params.search_url, params);
+      const result = await grinfiRequest("POST", "/leads/api/data-sources", body);
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "import_ln_my_network",
+    `Queue an import of YOUR OWN LinkedIn 1st-degree connections — creates real persistent job. Triggers: "import my LinkedIn connections", "pull my 1st-degree network", "load my connections". Required: list_uuid. Optional: sender_profile_uuid (required for execution — defines whose network), tags, force_list_move, add_tags_to_duplicate. Large networks may take hours to walk.`,
+    {
+      list_uuid: z.string().describe("Target contact list"),
+      sender_profile_uuid: z.string().optional().describe("Sender profile whose LinkedIn account is the source of the network"),
+      tags: z.array(z.string()).optional(),
+      force_list_move: z.boolean().optional(),
+      add_tags_to_duplicate: z.boolean().optional(),
+    },
+    { readOnlyHint: false, destructiveHint: false },
+    async (params) => {
+      const body: Record<string, unknown> = {
+        type: "ln_my_network",
+        list_uuid: params.list_uuid,
+      };
+      if (params.sender_profile_uuid) body.sender_profile_uuid = params.sender_profile_uuid;
+      if (params.tags && params.tags.length > 0) body.tags = params.tags;
+      body.payload = {
+        force_list_move: params.force_list_move ?? false,
+        add_tags_to_duplicate: params.add_tags_to_duplicate ?? false,
+      };
+      const result = await grinfiRequest("POST", "/leads/api/data-sources", body);
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "import_post_engagement",
+    `Queue a LinkedIn post engagement import — harvests people who liked, reposted, or commented on a specific LinkedIn post (real persistent job). Triggers: "import post engagers", "pull people who liked this post", "get commenters from LinkedIn post", "warm audience from post". Required: post_url (.../posts/...-activity-...), list_uuid. Optional: sender_profile_uuid (required for execution), likes/reposts/comments (booleans, default all true), tags, force_list_move, add_tags_to_duplicate.`,
+    {
+      post_url: z.string().url().describe("LinkedIn post URL (https://www.linkedin.com/posts/...-activity-...)"),
+      list_uuid: z.string().describe("Target contact list"),
+      sender_profile_uuid: z.string().optional().describe("Sender profile that fetches the engagers list"),
+      likes: z.boolean().optional().describe("Include people who liked the post (default true)"),
+      reposts: z.boolean().optional().describe("Include people who reposted (default true)"),
+      comments: z.boolean().optional().describe("Include people who commented (default true)"),
+      tags: z.array(z.string()).optional(),
+      force_list_move: z.boolean().optional(),
+      add_tags_to_duplicate: z.boolean().optional(),
+    },
+    { readOnlyHint: false, destructiveHint: false },
+    async (params) => {
+      const body = buildUrlImportBody("post_engagement", params.list_uuid, params.post_url, {
+        sender_profile_uuid: params.sender_profile_uuid,
+        tags: params.tags,
+        force_list_move: params.force_list_move,
+        add_tags_to_duplicate: params.add_tags_to_duplicate,
+        extra_payload: {
+          likes: params.likes ?? true,
+          reposts: params.reposts ?? true,
+          comments: params.comments ?? true,
+        },
+      });
+      const result = await grinfiRequest("POST", "/leads/api/data-sources", body);
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "import_sn_accounts_search",
+    `Queue a Sales Navigator company search import — creates real persistent job that pulls firmographic data. Triggers: "import companies from Sales Nav", "load SN accounts search", "pull firms from SN". Required: search_url, list_uuid. Optional: sender_profile_uuid (required for execution), tags, force_list_move, add_tags_to_duplicate. Imports COMPANIES not contacts.`,
+    {
+      search_url: z.string().url().describe("Sales Navigator company-search URL"),
+      list_uuid: z.string().describe("Target contact list (companies are stored separately but this is required by the data-source schema)"),
+      sender_profile_uuid: z.string().optional(),
+      tags: z.array(z.string()).optional(),
+      force_list_move: z.boolean().optional(),
+      add_tags_to_duplicate: z.boolean().optional(),
+    },
+    { readOnlyHint: false, destructiveHint: false },
+    async (params) => {
+      const body = buildUrlImportBody("sn_accounts_search", params.list_uuid, params.search_url, params);
+      const result = await grinfiRequest("POST", "/leads/api/data-sources", body);
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "import_sn_dynamic_search",
+    `Queue an import from a Sales Navigator AD-HOC (non-saved) search URL — creates real persistent import job. Triggers: "import this SN search", "pull contacts from SN URL", "load people from Sales Nav search". Required: search_url, list_uuid. Optional: sender_profile_uuid (required for execution), tags, force_list_move, add_tags_to_duplicate. For bookmarked searches use import_sn_saved_search; for companies use import_sn_accounts_search.`,
+    {
+      search_url: z.string().url().describe("Sales Navigator search URL (https://www.linkedin.com/sales/search/people?...)"),
+      list_uuid: z.string().describe("Target contact list"),
+      sender_profile_uuid: z.string().optional().describe("Sender profile that runs the SN search"),
+      tags: z.array(z.string()).optional(),
+      force_list_move: z.boolean().optional(),
+      add_tags_to_duplicate: z.boolean().optional(),
+    },
+    { readOnlyHint: false, destructiveHint: false },
+    async (params) => {
+      const body = buildUrlImportBody("sn_leads_search", params.list_uuid, params.search_url, params);
+      const result = await grinfiRequest("POST", "/leads/api/data-sources", body);
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "import_sn_saved_search",
+    `Queue an import from a Sales Navigator SAVED search URL — creates real persistent import job. Triggers: "import saved SN search", "pull leads from saved Sales Nav search", "import bookmarked SN search". Required: saved_search_url, list_uuid (target). Optional: sender_profile_uuid (REQUIRED for execution — the LI account that runs the query), tags, force_list_move, add_tags_to_duplicate. Without sender_profile_uuid the job won't execute. Sister tools: import_sn_dynamic_search, import_sn_accounts_search.`,
+    {
+      saved_search_url: z.string().url().describe("Sales Navigator saved-search URL (https://www.linkedin.com/sales/search/people?savedSearchId=...)"),
+      list_uuid: z.string().describe("Target contact list for imported leads (from list_lists)"),
+      sender_profile_uuid: z.string().optional().describe("Sender profile that runs the SN search; without this the job won't execute"),
+      tags: z.array(z.string()).optional().describe("Tag UUIDs to apply to imported leads"),
+      force_list_move: z.boolean().optional().describe("Force-move duplicates to the target list (default false)"),
+      add_tags_to_duplicate: z.boolean().optional().describe("Add tags to leads that already exist (default false)"),
+    },
+    { readOnlyHint: false, destructiveHint: false },
+    async (params) => {
+      const body = buildUrlImportBody("sn_leads_saved_search", params.list_uuid, params.saved_search_url, params);
+      const result = await grinfiRequest("POST", "/leads/api/data-sources", body);
+      return jsonResult(result);
+    },
+  );
+
+  // ===========================
+  // TASKS (ported from cloud)
+  // ===========================
+
+  server.tool(
+    "list_tasks_simple",
+    `Legacy GET-based tasks listing — returns automation tasks with simple query-string pagination. The richer list_tasks (POST) supports complex filter objects; use this for plain "show me recent tasks" queries. Triggers: "recent tasks", "list tasks simple", "GET tasks". Optional: limit, offset, order_field, order_type. Backed by GET /flows/api/tasks.`,
+    {
+      limit: z.number().optional().describe("Max records per call. Default 100."),
+      offset: z.number().optional().describe("Pagination offset. Default 0."),
+      order_field: z.string().optional().describe("Sort field. Default 'created_at'."),
+      order_type: z.enum(["asc", "desc"]).optional().describe("Sort direction. Default 'desc'."),
+    },
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async (params) => {
+      const result = await grinfiRequest("GET", "/flows/api/tasks", undefined, buildQuery(params));
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "count_tasks",
+    `Return the total number of automation tasks matching an optional filter — without fetching the rows themselves. Cheap and fast for dashboards or capacity checks. Triggers: "how many tasks", "task count", "count pending tasks", "total tasks for sender X", "tasks across these flows". Returns {count}. Filter accepts ARRAY values for IN-clause: {flow_uuid: ['a','b']}, {type: ['linkedin_send_connection_request','linkedin_send_message']}, {sender_profile_uuid: ['s1','s2']}. Single string also works. Combine with {schedule_at: {">=": iso, "<": iso}} for a date window. Backed by POST /flows/api/tasks/count.`,
+    {
+      filter: z.record(z.string(), z.unknown()).optional().describe("Optional filter object. Examples: {flow_uuid: 'X'} or {flow_uuid: ['X','Y']} (array IN-clause), {sender_profile_uuid: ['s1','s2']}, {type: ['linkedin_send_connection_request']}, {schedule_at: {'>=': '2026-05-13T00:00:00Z', '<': '2026-05-15T00:00:00Z'}}."),
+    },
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async (params) => {
+      const body: Record<string, unknown> = {};
+      if (params.filter) body.filter = params.filter;
+      const result = await grinfiRequest("POST", "/flows/api/tasks/count", body);
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "get_task_metrics",
+    `Fetch task-execution metrics aggregated by sender profile and status — used to fill a "tasks by sender" widget. Triggers: "task metrics by sender", "how many tasks per sender", "task breakdown by status". Returns metrics object keyed by sender_profile_uuid × status. Required: sender_profiles_uuids (array), statuses (array of task statuses, e.g. ['pending','completed','failed']). Backed by POST /flows/api/tasks/metrics.`,
+    {
+      sender_profiles_uuids: z.array(z.string()).describe("Sender-profile UUIDs to include. Get via list_sender_profiles."),
+      statuses: z.array(z.string()).describe("Task statuses to aggregate. Common values: pending, completed, failed, skipped, cancelled."),
+    },
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async (params) => {
+      const result = await grinfiRequest("POST", "/flows/api/tasks/metrics", { sender_profiles_uuids: params.sender_profiles_uuids, statuses: params.statuses });
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "update_task",
+    `Update editable fields of an automation task by UUID — typically used for rescheduling, reassigning, or editing the payload before execution. Triggers: "edit task X", "reschedule task", "reassign task to user Y", "update task payload". Required: uuid (path). Optional: any updatable field (scheduled_at, assigned_to, payload, status, etc. — fields vary by task type). Backed by PUT /flows/api/tasks/{uuid}.`,
+    {
+      uuid: z.string().describe("UUID of the task to update (from list_tasks / get_task)."),
+      fields: z.record(z.string(), z.unknown()).describe("Object with fields to update. Common: scheduled_at, assigned_to, payload."),
+    },
+    { readOnlyHint: false, destructiveHint: false },
+    async (params) => {
+      const result = await grinfiRequest("PUT", `/flows/api/tasks/${params.uuid}`, params.fields);
+      return jsonResult(result);
+    },
+  );
+
+  // ===========================
+  // FLOWS / AUTOMATIONS (ported from cloud)
+  // ===========================
+
+  server.tool(
+    "create_flow",
+    `Create a brand-new automation from scratch with custom nodes (steps). Triggers: "set up a new outreach campaign", "create a fresh flow with these steps", "build new LinkedIn sequence", "make an automation that does X". Returns the new flow UUID — call start_automation to activate it (it lands in 'draft' status). Required: name, use_sender_schedule, schedule (timezone + timeblocks), nodes (array of step definitions), contact_sources. Optional: description, priority, is_public, ai_agent_uuid, flow_workspace_uuid. For copying an existing flow use clone_automation instead — much simpler.`,
+    {
+      name: z.string().describe("Display name for the new flow"),
+      use_sender_schedule: z.boolean().describe("If true, use sender profile's schedule. If false, use the schedule field below."),
+      schedule: z.record(z.string(), z.unknown()).describe("Schedule with {timezone, timeblocks: [{dow: 0-6, min: 0-1440, max: 0-1440}], use_lead_timezone}"),
+      nodes: z.array(z.record(z.string(), z.unknown())).describe("Array of flow node definitions (steps). Get example shape from get_automation on an existing flow."),
+      contact_sources: z.array(z.record(z.string(), z.unknown())).describe("Array of contact source bindings (lists/filters that feed the flow)"),
+      description: z.string().optional(),
+      priority: z.number().int().min(1).max(10).optional().describe("Default 1"),
+      is_public: z.boolean().optional(),
+      ai_agent_uuid: z.string().optional().describe("Optional AI agent for AI-driven steps"),
+      flow_workspace_uuid: z.string().optional().describe("Optional target workspace"),
+    },
+    { readOnlyHint: false, destructiveHint: false },
+    async (params) => {
+      const body: Record<string, unknown> = {
+        name: params.name,
+        use_sender_schedule: params.use_sender_schedule,
+        schedule: params.schedule,
+        nodes: params.nodes,
+        contact_sources: params.contact_sources,
+        priority: params.priority ?? 1,
+      };
+      if (params.description !== undefined) body.description = params.description;
+      if (params.is_public !== undefined) body.is_public = params.is_public;
+      if (params.ai_agent_uuid) body.ai_agent_uuid = params.ai_agent_uuid;
+      if (params.flow_workspace_uuid) body.flow_workspace_uuid = params.flow_workspace_uuid;
+      const result = await grinfiRequest("POST", "/flows/api/flows", body);
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "publish_flow_publicly",
+    `Make a flow accessible via a public share link (anyone with the link can preview the flow definition). Returns the public share UUID/URL to distribute. Triggers: "share this flow publicly", "make flow X public", "create share link for automation". Use get_public_flow to read it back via the share link. Required: flow_uuid. Backed by POST /flows/api/flows/{uuid}/make-public.`,
+    {
+      flow_uuid: z.string().describe("UUID of the flow/automation to publish publicly."),
+    },
+    { readOnlyHint: false, destructiveHint: false },
+    async (params) => {
+      const result = await grinfiRequest("POST", `/flows/api/flows/${params.flow_uuid}/make-public`);
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "get_public_flow",
+    `Fetch the public/shared definition of a flow by its public share UUID — read-only view that does not require workspace auth context (intended for sharable preview links). Triggers: "open shared flow link", "view public flow X", "preview shared automation". Required: share_uuid (the public link token, not the regular flow UUID). Backed by GET /flows/api/flows/share/{share_uuid}.`,
+    {
+      share_uuid: z.string().describe("Public share UUID/token of the flow (not the internal flow_uuid)."),
+    },
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async (params) => {
+      const result = await grinfiRequest("GET", `/flows/api/flows/share/${params.share_uuid}`);
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "get_all_sender_profiles_for_flows",
+    `Return every sender profile referenced by a given list of flow UUIDs — single round-trip alternative to N calls to get_automation. Useful for bulk audits ("which senders are used across these 10 flows"). Triggers: "senders used in flows", "which sender profiles do these automations use", "flow→sender mapping". Required: uuids (array of flow UUIDs). Backed by POST /flows/api/flows/all-sender-profiles.`,
+    {
+      uuids: z.array(z.string()).describe("Array of flow/automation UUIDs to inspect."),
+    },
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async (params) => {
+      const result = await grinfiRequest("POST", "/flows/api/flows/all-sender-profiles", { uuids: params.uuids });
+      return jsonResult(result);
+    },
+  );
+
+  // ===========================
+  // MAILBOXES & SENDER PROFILES (ported from cloud)
+  // ===========================
+
+  server.tool(
+    "activate_mailboxes_bulk",
+    `Activate (enable sending) on a set of mailboxes in one call — bulk version of activate_mailbox. Mailboxes resume normal automation participation. Triggers: "activate these mailboxes", "enable sending on mailboxes X,Y,Z", "turn on mailboxes bulk". Required: uuids (array of mailbox UUIDs). Use list_mailboxes to discover candidates. Backed by POST /emails/api/mailboxes/activate.`,
+    {
+      uuids: z.array(z.string()).describe("Array of mailbox UUIDs to activate."),
+    },
+    { readOnlyHint: false, destructiveHint: false },
+    async (params) => {
+      const result = await grinfiRequest("POST", "/emails/api/mailboxes/activate", { uuids: params.uuids });
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "deactivate_mailboxes_bulk",
+    `Deactivate (pause sending) on a set of mailboxes in one call — bulk version of deactivate_mailbox. Mailboxes stop participating in automations but are not deleted. Triggers: "pause these mailboxes", "deactivate mailboxes X,Y,Z bulk", "stop sending on mailboxes". Required: uuids (array). Reverse with activate_mailboxes_bulk. Backed by POST /emails/api/mailboxes/deactivate.`,
+    {
+      uuids: z.array(z.string()).describe("Array of mailbox UUIDs to deactivate."),
+    },
+    { readOnlyHint: false, destructiveHint: false },
+    async (params) => {
+      const result = await grinfiRequest("POST", "/emails/api/mailboxes/deactivate", { uuids: params.uuids });
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "reconnect_mailbox_smtp",
+    `Re-establish SMTP connection for a mailbox with fresh credentials — used when SMTP password rotated or auth failed. Provide the provider key plus connection_settings object (host/port/username/password/encryption). Triggers: "reconnect mailbox X smtp", "fix smtp auth for mailbox", "update smtp credentials". Required: mailbox_uuid, provider, connection_settings. Backed by POST /emails/api/mailboxes/{uuid}/reconnect-to-smtp.`,
+    {
+      mailbox_uuid: z.string().describe("UUID of the mailbox to reconnect."),
+      provider: z.string().describe("Provider key (e.g. 'gmail', 'outlook', 'custom_smtp')."),
+      connection_settings: z.record(z.string(), z.unknown()).describe("SMTP settings object: host, port, username, password, encryption (tls|ssl|none)."),
+    },
+    { readOnlyHint: false, destructiveHint: false },
+    async (params) => {
+      const result = await grinfiRequest("POST", `/emails/api/mailboxes/${params.mailbox_uuid}/reconnect-to-smtp`, { provider: params.provider, connection_settings: params.connection_settings });
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "setup_mailbox_tracking_domain",
+    `Attach an existing custom tracking domain to a mailbox — replaces default open/click tracking domain with branded one (e.g. track.your-brand.com). Get domain UUIDs via list_custom_tracking_domains. Triggers: "use custom tracking domain on mailbox X", "set tracking domain for mailbox", "brand my email tracking links". Required: mailbox_uuid (path), custom_tracking_domain_uuid. Backed by PUT /emails/api/mailboxes/{uuid}/setup-custom-tracking-domain.`,
+    {
+      mailbox_uuid: z.string().describe("UUID of the mailbox to update."),
+      custom_tracking_domain_uuid: z.string().describe("UUID of the custom tracking domain to attach (from list_custom_tracking_domains)."),
+    },
+    { readOnlyHint: false, destructiveHint: false },
+    async (params) => {
+      const result = await grinfiRequest("PUT", `/emails/api/mailboxes/${params.mailbox_uuid}/setup-custom-tracking-domain`, { custom_tracking_domain_uuid: params.custom_tracking_domain_uuid });
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "remove_mailbox_tracking_domain",
+    `Detach the custom tracking domain from a mailbox — reverts open/click tracking to the default platform domain. Does not delete the domain itself (use delete_custom_tracking_domain for that). Triggers: "remove custom tracking from mailbox X", "stop using branded tracking", "revert mailbox to default tracking". Required: mailbox_uuid. Backed by PUT /emails/api/mailboxes/{uuid}/remove-custom-tracking-domain.`,
+    {
+      mailbox_uuid: z.string().describe("UUID of the mailbox to detach the tracking domain from."),
+    },
+    { readOnlyHint: false, destructiveHint: false },
+    async (params) => {
+      const result = await grinfiRequest("PUT", `/emails/api/mailboxes/${params.mailbox_uuid}/remove-custom-tracking-domain`);
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "detect_email_provider",
+    `Detect which email provider (Gmail, Outlook, Yandex, custom SMTP, etc.) handles a given email address by MX-record lookup — used by the UI's "Add mailbox" wizard to auto-select OAuth flow vs SMTP config. Triggers: "what provider is foo@bar.com", "detect mailbox provider", "is email X gmail or outlook". Returns provider info or 400 if MX lookup fails. Required: email. Backed by POST /emails/api/mailboxes/find-email-provider.`,
+    {
+      email: z.string().describe("Full email address whose provider should be detected (e.g. 'alice@example.com')."),
+    },
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async (params) => {
+      const result = await grinfiRequest("POST", "/emails/api/mailboxes/find-email-provider", { email: params.email });
+      return jsonResult(result);
+    },
+  );
+
+  server.tool("check_sender_status", `One-call dispatch-readiness check for a sender profile across BOTH channels — answers "if I queue a task for this sender right now, will it actually go out?". Triggers: "is this sender ready", "can sender X send now", "check sender readiness", "why isn't this sender sending". Required: sender_profile_uuid (from list_sender_profiles). Read-only. Per channel returns 'working' (dispatches now) | 'error' (bound but blocked — reason + drill-down tool included) | 'not_connected' (nothing bound). LinkedIn ready = its seat is 'active' with a valid cookie; email ready = the mailbox send_status is 'active'. For a deep drill-down use diagnose_linkedin_browser / diagnose_mailbox; for the whole fleet use get_health_snapshots.`, {
+    sender_profile_uuid: z.string().describe("Sender profile UUID (from list_sender_profiles)"),
+  },
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    async (params) => {
+    const senderUuid = params.sender_profile_uuid;
+    const [senderRes, browsersRes, mailboxesRes] = await Promise.all([
+      grinfiRequest("GET", `/flows/api/sender-profiles/${senderUuid}`).catch(() => null),
+      grinfiRequest("POST", "/browsers/api/linkedin-browsers/list", { limit: 200, offset: 0 }).catch(() => null),
+      grinfiRequest("GET", "/emails/api/mailboxes").catch(() => null),
+    ]);
+    const pickArray = (r: unknown): Record<string, unknown>[] => {
+      if (Array.isArray(r)) return r as Record<string, unknown>[];
+      if (r && typeof r === "object" && Array.isArray((r as { data?: unknown }).data)) {
+        return (r as { data: Record<string, unknown>[] }).data;
+      }
+      return [];
+    };
+    const sender = senderRes && typeof senderRes === "object" ? (senderRes as Record<string, unknown>) : null;
+    const browser = pickArray(browsersRes).find((b) => b.sender_profile_uuid === senderUuid) ?? null;
+    const mailbox = pickArray(mailboxesRes).find((m) => m.sender_profile_uuid === senderUuid) ?? null;
+    return jsonResult(deriveSenderStatus(senderUuid, sender, browser, mailbox));
+  });
+
+  server.tool(
+    "disable_smart_limits_for_sender",
+    `Turn OFF smart-limits enforcement on a sender profile — sender will continue to send messages even if approaching account safety limits. Use cautiously: smart limits exist to prevent LinkedIn/email bans. Triggers: "turn off smart limits for sender X", "disable safety limits", "unblock sender from smart-limit pause". Required: sender_profile_uuid. Backed by PUT /flows/api/sender-profiles/{uuid}/disable-smart-limits.`,
+    {
+      sender_profile_uuid: z.string().describe("UUID of the sender profile to disable smart limits on. Get via list_sender_profiles."),
+    },
+    { readOnlyHint: false, destructiveHint: false },
+    async (params) => {
+      const result = await grinfiRequest("PUT", `/flows/api/sender-profiles/${params.sender_profile_uuid}/disable-smart-limits`);
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "enable_smart_limits_for_sender",
+    `Turn ON smart-limits enforcement on a sender profile — sender will throttle/pause when approaching daily safety limits (recommended default for LinkedIn/email accounts). Reverses disable_smart_limits_for_sender. Triggers: "enable smart limits for sender X", "re-enable safety throttle", "protect sender from bans". Required: sender_profile_uuid. Backed by PUT /flows/api/sender-profiles/{uuid}/enable-smart-limits.`,
+    {
+      sender_profile_uuid: z.string().describe("UUID of the sender profile to enable smart limits on. Get via list_sender_profiles."),
+    },
+    { readOnlyHint: false, destructiveHint: false },
+    async (params) => {
+      const result = await grinfiRequest("PUT", `/flows/api/sender-profiles/${params.sender_profile_uuid}/enable-smart-limits`);
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "list_sender_profiles_filtered",
+    `Browse sender profiles with full filtering, sorting, and pagination — the search variant of list_sender_profiles. Triggers: "show senders for LinkedIn", "find sender profiles by name X", "active senders only". Returns paginated list. For accounts with many senders this is much faster than list_sender_profiles (which has no filter). Optional: filter (record), limit, offset, order_field, order_type, q (text search).`,
+    {
+      filter: z.record(z.string(), z.unknown()).optional(),
+      limit: z.number().int().min(1).max(200).optional(),
+      offset: z.number().int().min(0).optional(),
+      order_field: z.string().optional(),
+      order_type: z.enum(["asc", "desc"]).optional(),
+      q: z.string().optional().describe("Free-text search"),
+    },
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async (params) => {
+      const body: Record<string, unknown> = {
+        limit: params.limit ?? 50,
+        offset: params.offset ?? 0,
+      };
+      if (params.filter) body.filter = params.filter;
+      if (params.order_field) body.order_field = params.order_field;
+      if (params.order_type) body.order_type = params.order_type;
+      if (params.q) body.q = params.q;
+      const result = await grinfiRequest("POST", "/flows/api/sender-profiles/list", body);
+      return jsonResult(result);
+    },
+  );
+
+  // ===========================
+  // LINKEDIN BROWSERS incl. external cloud (ported from cloud)
+  // ===========================
+
+  server.tool(
+    "update_linkedin_browser",
+    `Update editable fields of a LinkedIn browser profile by its internal integer ID — name, proxy, sharing settings, etc. Triggers: "rename linkedin browser", "update browser X settings", "change browser proxy". Required: id (integer internal ID — NOT UUID; browser endpoints use int IDs). Optional: name, proxy_id, settings object. Backed by PUT /browsers/api/linkedin-browsers/{id}.`,
+    {
+      id: z.number().int().describe("Integer internal ID of the LinkedIn browser (from list_linkedin_browsers — numeric 'id' field, not 'uuid')."),
+      fields: z.record(z.string(), z.unknown()).describe("Object with fields to update. Common: name, proxy_id, settings (object)."),
+    },
+    { readOnlyHint: false, destructiveHint: false },
+    async (params) => {
+      const result = await grinfiRequest("PUT", `/browsers/api/linkedin-browsers/${params.id}`, params.fields);
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "check_linkedin_browser_proxy",
+    `Test a proxy configuration before assigning it to a LinkedIn browser — validates host/port reachability and optional credentials. Triggers: "test proxy for linkedin", "is this proxy working", "check proxy host:port". Required: proxy.host, proxy.port. Optional: proxy.username, proxy.password, proxy.type. Backed by POST /browsers/api/linkedin-browsers/check-proxy.`,
+    {
+      proxy: z.object({
+        host: z.string().describe("Proxy host (IP or domain)."),
+        port: z.union([z.string(), z.number()]).describe("Proxy port."),
+        username: z.string().optional().describe("Optional proxy auth username."),
+        password: z.string().optional().describe("Optional proxy auth password."),
+        type: z.string().optional().describe("Optional proxy type (http, socks5, etc.)."),
+      }).describe("Proxy configuration to test."),
+    },
+    { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    async (params) => {
+      const result = await grinfiRequest("POST", "/browsers/api/linkedin-browsers/check-proxy", { proxy: params.proxy });
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "connect_linkedin_browser_to_external_cloud",
+    `Connect an existing LinkedIn browser profile to an external cloud runner using a shared access_key — moves execution out of Grinfi's default infra. Triggers: "connect linkedin browser to external cloud", "link browser to my own runner", "use external cloud for browser X". Required: access_key. Optional: browser_uuid if targeting a specific profile. Backed by POST /browsers/api/linkedin-browsers/external-cloud-connect.`,
+    {
+      access_key: z.string().describe("External cloud access key (from generate_external_browser_access_key)."),
+      browser_uuid: z.string().optional().describe("Optional UUID of the existing LinkedIn browser profile to connect."),
+    },
+    { readOnlyHint: false, destructiveHint: false },
+    async (params) => {
+      const body: Record<string, unknown> = { access_key: params.access_key };
+      if (params.browser_uuid) body.browser_uuid = params.browser_uuid;
+      const result = await grinfiRequest("POST", "/browsers/api/linkedin-browsers/external-cloud-connect", body);
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "generate_external_browser_access_key",
+    `Mint a new external-cloud access key for a LinkedIn browser profile — share this key with the external runner so it can attach/run the browser via run_linkedin_browser_external. Triggers: "give me access key for browser X", "generate external key", "issue cloud token for linkedin browser". Required: id (browser internal numeric ID — NOT UUID; LinkedIn browsers use int IDs internally). Backed by POST /browsers/api/linkedin-browsers/{id}/generate-external-access-key.`,
+    {
+      id: z.number().int().describe("Integer internal ID of the LinkedIn browser (from list_linkedin_browsers — look for the numeric 'id' field, not 'uuid')."),
+    },
+    { readOnlyHint: false, destructiveHint: false },
+    async (params) => {
+      const result = await grinfiRequest("POST", `/browsers/api/linkedin-browsers/${params.id}/generate-external-access-key`);
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "run_linkedin_browser_external",
+    `Start a LinkedIn browser session in an externally-hosted environment using a pre-shared access_key — used when integrating Grinfi with a customer's own browser farm. Triggers: "run linkedin browser in our cloud", "start external browser session", "launch browser with access key". Required: access_key. Optional: additional config (cookies, viewport, etc.). Backed by POST /browsers/api/linkedin-browsers/external-run.`,
+    {
+      access_key: z.string().describe("Pre-shared access key issued by generate_external_browser_access_key or supplied by the external cloud."),
+      config: z.record(z.string(), z.unknown()).optional().describe("Optional extra config (cookies, viewport, user_agent, etc.)."),
+    },
+    { readOnlyHint: false, destructiveHint: false },
+    async (params) => {
+      const body: Record<string, unknown> = { access_key: params.access_key };
+      if (params.config) Object.assign(body, params.config);
+      const result = await grinfiRequest("POST", "/browsers/api/linkedin-browsers/external-run", body);
+      return jsonResult(result);
+    },
+  );
+
+  // ===========================
+  // EXPORT WEBHOOKS (ported from cloud)
+  // ===========================
+
+  server.tool(
+    "trigger_lead_export_webhook",
+    `Manually fire the "lead exported" webhook for a set of leads — useful for replaying a delivery to a CRM/Slack/Zapier subscriber after a downstream outage. Triggers: "resend lead export to webhook", "fire lead export webhook again", "replay leads to webhook X". Required: webhook_uuid (target webhook from list_webhooks), filter or ids selecting which leads. Backed by PUT /leads/api/leads/call-exported-webhook.`,
+    {
+      webhook_uuid: z.string().describe("UUID of the target webhook (from list_webhooks)."),
+      filter: z.record(z.string(), z.unknown()).optional().describe("Optional filter object to select leads. Same shape as search_contacts filter."),
+      ids: z.array(z.string()).optional().describe("Explicit lead UUIDs to send. Either filter or ids should be provided."),
+    },
+    { readOnlyHint: false, destructiveHint: false },
+    async (params) => {
+      const body: Record<string, unknown> = { webhook_uuid: params.webhook_uuid };
+      if (params.filter) body.filter = params.filter;
+      if (params.ids) body.ids = params.ids;
+      const result = await grinfiRequest("PUT", "/leads/api/leads/call-exported-webhook", body);
+      return jsonResult(result);
+    },
+  );
+
+  server.tool(
+    "trigger_company_export_webhook",
+    `Manually fire the "company exported" webhook for a set of companies — replay deliveries after a downstream outage or for ad-hoc syncs. Triggers: "resend company export to webhook", "fire company export webhook again", "replay companies to webhook X". Required: webhook_uuid, filter or ids selecting which companies. Backed by PUT /leads/api/companies/call-exported-webhook.`,
+    {
+      webhook_uuid: z.string().describe("UUID of the target webhook (from list_webhooks)."),
+      filter: z.record(z.string(), z.unknown()).optional().describe("Optional filter object to select companies."),
+      ids: z.array(z.string()).optional().describe("Explicit company UUIDs to send. Either filter or ids should be provided."),
+    },
+    { readOnlyHint: false, destructiveHint: false },
+    async (params) => {
+      const body: Record<string, unknown> = { webhook_uuid: params.webhook_uuid };
+      if (params.filter) body.filter = params.filter;
+      if (params.ids) body.ids = params.ids;
+      const result = await grinfiRequest("PUT", "/leads/api/companies/call-exported-webhook", body);
+      return jsonResult(result);
+    },
+  );
 
   return server;
 }

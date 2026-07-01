@@ -294,6 +294,112 @@ Visit **[mcp.grinfi.io](https://mcp.grinfi.io)** to generate your personal MCP e
 | `list_outbound_log` | Outbound HTTP log: webhook deliveries, automation API calls, enrichment requests |
 | `test_llm_connection` | Smoke-test a stored LLM integration (~5 token cost) |
 
+### CRM read & helpers *(new in 1.3)*
+
+| Tool | Description |
+|------|-------------|
+| `get_leads_by_uuids` | Fetch multiple contacts by their UUIDs in one round-trip |
+| `list_lead_uuids` | Lightweight UUID-only listing of leads matching a filter (much smaller than `search_contacts`) |
+| `list_company_uuids` | Lightweight UUID-only listing of companies matching a filter |
+| `suggest_lead_filter_values` | Typeahead suggestions for contact filter fields — discover valid values to filter by |
+| `suggest_company_filter_values` | Typeahead suggestions for company filter fields |
+| `create_lead` | Create one or more leads in a target list (bulk-friendly alternative to `upsert_contact`) |
+
+### Metrics & statistics *(new in 1.3)*
+
+| Tool | Description |
+|------|-------------|
+| `get_custom_field_metrics` | Usage metrics for custom fields — how many records have a value set |
+| `get_pipeline_stage_metrics` | Funnel analytics: how many leads/companies sit in each pipeline stage |
+| `get_sender_profile_metrics` | Per-sender analytics: sends, replies, bounces, response-rate |
+| `get_outreach_metrics` | High-level outreach analytics in one call: connection requests sent vs accepted, messages, replies |
+| `get_ai_agent_lead_metrics` | Performance metrics for AI agents — leads engaged by engagement status |
+| `get_flow_node_statistics` | Per-step funnel for an automation: how many leads passed each node and where they dropped off |
+| `get_flow_contact_source_statistics` | Per-contact-source breakdown of leads inside an automation |
+| `get_enrichment_queue_metrics_filtered` | Enrichment-queue metrics for the current month, optionally narrowed by a filter |
+| `get_enrichment_queue_item` | Fetch a single enrichment-queue item by numeric ID (provider, status, cost, target) |
+
+### Mass actions *(new in 1.3)*
+
+| Tool | Description |
+|------|-------------|
+| `leads_mass_action_by_filter` | Default filter-based bulk contact op — server fetches UUIDs, chunks them, applies the action (supports `dry_run`) |
+| `list_mass_actions` | Browse the history of mass-action jobs run on this workspace |
+| `get_mass_action_status` | Poll the status of a specific mass-action job by UUID |
+| `get_mass_action_metrics` | Execution metrics for mass-action jobs — progress, succeeded/failed counts |
+| `cancel_mass_action` | Abort a still-running mass-action job before it finishes |
+
+### CSV bulk update *(new in 1.3)*
+
+| Tool | Description |
+|------|-------------|
+| `update_leads_from_csv` | Bulk-update existing contacts from a local CSV (matched by uuid/email) |
+| `update_companies_from_csv` | Bulk-update existing companies from a local CSV |
+| `add_to_blacklist_from_csv` | Bulk-add contacts to the blacklist from a local CSV (emails, LinkedIn IDs, or UUIDs) |
+
+> These take a local `file_path` (like `upload_csv`) — the server reads the file from disk.
+
+### Lead imports — LinkedIn / Sales Navigator *(new in 1.3)*
+
+| Tool | Description |
+|------|-------------|
+| `import_ln_leads_search` | Queue a regular LinkedIn (non-Sales-Navigator) people-search import |
+| `import_ln_my_network` | Queue an import of your own LinkedIn 1st-degree connections |
+| `import_post_engagement` | Harvest people who liked, reposted, or commented on a specific LinkedIn post |
+| `import_sn_accounts_search` | Queue a Sales Navigator company search import |
+| `import_sn_dynamic_search` | Queue an import from a Sales Navigator ad-hoc (non-saved) search URL |
+| `import_sn_saved_search` | Queue an import from a Sales Navigator saved search URL |
+
+### Tasks *(new in 1.3)*
+
+| Tool | Description |
+|------|-------------|
+| `list_tasks_simple` | Simple GET-based automation-tasks listing with query-string pagination |
+| `count_tasks` | Count automation tasks matching a filter without fetching the rows |
+| `get_task_metrics` | Task-execution metrics aggregated by sender profile and status |
+| `update_task` | Update editable fields of an automation task (reschedule, reassign, edit payload) |
+
+### Flows / automations *(new in 1.3)*
+
+| Tool | Description |
+|------|-------------|
+| `create_flow` | Create a brand-new automation from scratch with custom nodes (steps) |
+| `publish_flow_publicly` | Make a flow accessible via a public share link |
+| `get_public_flow` | Fetch the public/shared definition of a flow by its share UUID (read-only) |
+| `get_all_sender_profiles_for_flows` | Return every sender profile referenced by a list of flow UUIDs, in one call |
+
+### Mailboxes & sender profiles *(new in 1.3)*
+
+| Tool | Description |
+|------|-------------|
+| `activate_mailboxes_bulk` | Enable sending on a set of mailboxes in one call |
+| `deactivate_mailboxes_bulk` | Pause sending on a set of mailboxes in one call |
+| `reconnect_mailbox_smtp` | Re-establish a mailbox's SMTP connection with fresh credentials |
+| `setup_mailbox_tracking_domain` | Attach a custom (branded) open/click tracking domain to a mailbox |
+| `remove_mailbox_tracking_domain` | Revert a mailbox's tracking to the default platform domain |
+| `detect_email_provider` | Detect the email provider (Gmail, Outlook, Yandex, custom SMTP) for an address via MX lookup |
+| `check_sender_status` | One-call dispatch-readiness check for a sender across LinkedIn + email channels |
+| `disable_smart_limits_for_sender` | Turn off smart-limits enforcement on a sender profile |
+| `enable_smart_limits_for_sender` | Turn on smart-limits enforcement (throttle near daily safety limits) |
+| `list_sender_profiles_filtered` | Browse sender profiles with filtering, sorting, and pagination |
+
+### LinkedIn browsers — external cloud *(new in 1.3)*
+
+| Tool | Description |
+|------|-------------|
+| `update_linkedin_browser` | Update a LinkedIn browser profile by internal ID (name, proxy, sharing) |
+| `check_linkedin_browser_proxy` | Test a proxy configuration before assigning it to a browser |
+| `connect_linkedin_browser_to_external_cloud` | Connect a browser profile to an external cloud runner via a shared access key |
+| `generate_external_browser_access_key` | Mint an external-cloud access key for a LinkedIn browser profile |
+| `run_linkedin_browser_external` | Start a browser session in an externally-hosted environment via a pre-shared access key |
+
+### Export webhooks *(new in 1.3)*
+
+| Tool | Description |
+|------|-------------|
+| `trigger_lead_export_webhook` | Manually fire the "lead exported" webhook for a set of leads (replay a delivery) |
+| `trigger_company_export_webhook` | Manually fire the "company exported" webhook for a set of companies |
+
 ---
 
 ## Example Conversations
