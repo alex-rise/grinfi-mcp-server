@@ -1949,6 +1949,8 @@ function createMcpServer(): McpServer {
         params.file_path,
         "file",
         params.filename,
+        undefined,
+        "text/csv",
       );
       return jsonResult(result);
     },
