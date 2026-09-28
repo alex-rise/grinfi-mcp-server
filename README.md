@@ -1,5 +1,12 @@
 # Grinfi MCP Server
 
+> [!IMPORTANT]
+> **This repository is archived and no longer maintained.**
+>
+> Use the hosted Grinfi MCP instead: **[mcp.grinfi.io](https://mcp.grinfi.io)**. Nothing to install, always up to date, and it works with Claude, ChatGPT and Codex. Open the link for the setup steps.
+>
+> The local version below is behind the hosted one, and some of its tools no longer work (for example, writing custom field values).
+
 Connect **Claude** to your **Grinfi.io** account. Manage contacts, automations, messages, and more — all through natural language.
 
 ---
